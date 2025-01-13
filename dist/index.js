@@ -78,147 +78,6 @@ async function withRetry(operation, retries = MAX_RETRIES) {
         throw error;
     }
 }
-function chunkDiff(diff, maxChunkSize = 4000) {
-    if (!diff) {
-        throw new Error('Diff is empty');
-    }
-    const lines = diff.split('\n');
-    const chunks = [];
-    let currentChunk = [];
-    let currentSize = 0;
-    for (const line of lines) {
-        if (currentSize + line.length > maxChunkSize && currentChunk.length > 0) {
-            chunks.push(currentChunk.join('\n'));
-            currentChunk = [];
-            currentSize = 0;
-        }
-        currentChunk.push(line);
-        currentSize += line.length;
-    }
-    if (currentChunk.length > 0) {
-        chunks.push(currentChunk.join('\n'));
-    }
-    return chunks;
-}
-async function getDiff({ owner, repo, pull_number }) {
-    const response = await withRetry(() => octokit.pulls.get({
-        owner,
-        repo,
-        pull_number,
-        mediaType: {
-            format: 'diff',
-        },
-    }));
-    if (typeof response.data === 'string') {
-        return response.data;
-    }
-    throw new Error('Failed to get diff in correct format');
-}
-async function getCommentContext(owner, repo, comment_id) {
-    try {
-        const { data: comment } = await withRetry(() => octokit.issues.getComment({
-            owner,
-            repo,
-            comment_id,
-        }));
-        if (!comment?.body) {
-            console.log('Comment body is empty');
-            return null;
-        }
-        const prNumber = comment.issue_url.split('/').pop();
-        if (!prNumber) {
-            console.log('Could not extract PR number from URL');
-            return null;
-        }
-        const { data: pr } = await withRetry(() => octokit.pulls.get({
-            owner,
-            repo,
-            pull_number: parseInt(prNumber, 10),
-        }));
-        const contextKey = `${pr.number}-${comment_id}`;
-        let context = conversationContexts.get(contextKey);
-        if (!context) {
-            const codeMatch = comment.body.match(/\`\`\`[\s\S]*?\`\`\`/);
-            if (codeMatch) {
-                context = {
-                    filePath: 'unknown',
-                    lineStart: 0,
-                    lineEnd: 0,
-                    code: codeMatch[0],
-                    messages: [{
-                            role: 'assistant',
-                            content: comment.body,
-                        }],
-                };
-                conversationContexts.set(contextKey, context);
-            }
-        }
-        return context || null;
-    }
-    catch (error) {
-        console.error('Error getting comment context:', error);
-        return null;
-    }
-}
-async function analyzeCodeWithDeepSeek(chunk, context) {
-    if (!chunk) {
-        throw new Error('Empty chunk provided for analysis');
-    }
-    const systemPrompt = context
-        ? `Вы эксперт по проверке кода для React + TypeScript проектов. Вы участвуете в обсуждении кода. 
-       Контекст обсуждения:
-       Файл: ${context.filePath}
-       Строки: ${context.lineStart}-${context.lineEnd}
-       Код:
-       ${context.code}
-       
-       Предыдущие сообщения:
-       ${context.messages.map(m => `${m.role}: ${m.content}`).join('\n')}
-       
-       Ответьте на последний вопрос пользователя, учитывая весь контекст обсуждения.`
-        : `Вы эксперт по проверке кода для React + TypeScript проектов. Проанализируйте следующий diff и предоставьте структурированный отзыв по трем категориям:
-       1. Качество кода (форматирование, читаемость, следование лучшим практикам, наличие типизации)
-       2. Безопасность (уязвимости, обработка данных, аутентификация)
-       3. Производительность (оптимизации React, управление состоянием, мемоизация, ошибки использования хуков)
-       
-       Формат ответа должен быть в виде JSON:
-       {
-         "quality": ["пункт 1", "пункт 2", ...],
-         "security": ["пункт 1", "пункт 2", ...],
-         "performance": ["пункт 1", "пункт 2", ...]
-       }`;
-    const response = await withRetry(() => (0, node_fetch_1.default)(DEEPSEEK_API_URL, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-        },
-        body: JSON.stringify({
-            model: 'deepseek-chat',
-            messages: [
-                {
-                    role: 'system',
-                    content: systemPrompt,
-                },
-                {
-                    role: 'user',
-                    content: chunk,
-                },
-            ],
-            response_format: context ? undefined : { type: 'json_object' },
-            temperature: 0.3,
-            max_tokens: 2000,
-        }),
-    }));
-    if (!response.ok) {
-        throw new Error(`DeepSeek API error: ${response.statusText}`);
-    }
-    const data = await response.json();
-    if (!data.choices?.[0]?.message?.content) {
-        throw new Error('Invalid response from DeepSeek API');
-    }
-    return data.choices[0].message.content;
-}
 // Функция для вычисления расстояния Левенштейна между строками
 function levenshteinDistance(a, b) {
     const matrix = Array(b.length + 1).fill(null).map(() => Array(a.length + 1).fill(null));
@@ -248,9 +107,9 @@ function findMostSimilarLine(targetLine, fileLines, startLine, endLine) {
         similarity: Infinity,
     };
     const normalizedTarget = normalizeCode(targetLine);
-    // Ищем в диапазоне ±10 строк от предполагаемой позиции
-    const searchStart = Math.max(0, startLine - 10);
-    const searchEnd = Math.min(fileLines.length, endLine + 10);
+    // Ищем в диапазоне ±30 строк от предполагаемой позиции
+    const searchStart = Math.max(0, startLine - 30);
+    const searchEnd = Math.min(fileLines.length, endLine + 30);
     for (let i = searchStart; i < searchEnd; i++) {
         const normalizedLine = normalizeCode(fileLines[i]);
         const distance = levenshteinDistance(normalizedTarget, normalizedLine);
@@ -263,8 +122,7 @@ function findMostSimilarLine(targetLine, fileLines, startLine, endLine) {
             };
         }
     }
-    // Если сходство слишком низкое, возвращаем изначальную строку
-    return bestMatch.similarity < 0.5 ? bestMatch.lineNumber : startLine;
+    return bestMatch;
 }
 async function analyzeFile(file, prInfo) {
     try {
@@ -398,15 +256,19 @@ async function analyzeFile(file, prInfo) {
             typeof issue.description === 'string')
             .map(issue => {
             // Ищем наиболее похожую строку
-            const actualLine = findMostSimilarLine(issue.code, fileLines, Math.max(0, issue.line - 30), // Начинаем поиск за 10 строк до
-            Math.min(fileLines.length, issue.line + 30) // Заканчиваем через 10 строк после
-            );
+            const match = findMostSimilarLine(issue.code, fileLines, Math.max(0, issue.line - 30), Math.min(fileLines.length, issue.line + 30));
+            // Если сходство слишком низкое (больше 0.3), пропускаем комментарий
+            if (match.similarity > 0.3) {
+                console.log(`Skipping comment for line ${issue.line} due to low similarity (${match.similarity})`);
+                return null;
+            }
             return {
                 path: file.filename,
-                line: actualLine,
-                body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, ответьте на этот комментарий.*`
+                line: match.lineNumber,
+                body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, нажмите на три точки (⋯), выберите "Quote reply" и начните текст с @ai или /ai*`
             };
-        });
+        })
+            .filter((comment) => comment !== null);
     }
     catch (error) {
         console.error(`Error analyzing file ${file.filename}:`, error);
@@ -485,29 +347,6 @@ async function commentOnPR(prInfo) {
         }
     }
 }
-function formatAnalysisComment(analysis) {
-    if (!analysis.quality?.length && !analysis.security?.length && !analysis.performance?.length) {
-        return `## 🤖 AI Code Review
-
-Код выглядит хорошо! Я не нашел существенных проблем.
-
----
-*Этот отзыв был сгенерирован автоматически с помощью AI Code Review.*`;
-    }
-    return `## 🤖 AI Code Review
-
-${analysis.quality.length ? `### 📝 Качество кода
-${analysis.quality.map(item => `- ${item}`).join('\n')}` : ''}
-
-${analysis.security.length ? `### 🔒 Безопасность
-${analysis.security.map(item => `- ${item}`).join('\n')}` : ''}
-
-${analysis.performance.length ? `### ⚡ Производительность
-${analysis.performance.map(item => `- ${item}`).join('\n')}` : ''}
-
----
-*Этот отзыв был сгенерирован автоматически с помощью AI Code Review.*`;
-}
 async function handlePRReview(prInfo) {
     console.log(`Анализирую PR #${prInfo.pull_number}...`);
     console.log('Анализирую файлы и оставляю комментарии...');
@@ -522,8 +361,8 @@ async function handleCommentReply(owner, repo, comment_id) {
         repo,
         comment_id,
     }));
-    if (!comment?.body || !comment.pull_request_url) {
-        console.error('Comment body or PR URL is empty');
+    if (!comment?.body || !comment.pull_request_url || !comment.line || !comment.path) {
+        console.error('Required comment data is missing');
         return;
     }
     // Проверяем, что комментарий содержит обращение к боту
@@ -544,15 +383,33 @@ async function handleCommentReply(owner, repo, comment_id) {
         pull_number: prNumber,
         per_page: 100,
     }));
-    // Ищем родительский комментарий от бота
+    // Ищем родительский комментарий от бота в той же строке
     const parentComment = reviewComments
         .reverse()
         .find(c => c.id < comment.id &&
+        c.path === comment.path &&
+        c.line === comment.line &&
         c.body?.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i));
     if (!parentComment?.body) {
         console.error('Could not find parent bot comment');
         return;
     }
+    // Получаем содержимое файла
+    const { data: fileContent } = await withRetry(() => octokit.repos.getContent({
+        owner,
+        repo,
+        path: comment.path,
+        ref: `pull/${prNumber}/head`,
+    }));
+    if (!('content' in fileContent)) {
+        throw new Error('File content not found');
+    }
+    const content = Buffer.from(fileContent.content, 'base64').toString();
+    const lines = content.split('\n');
+    // Получаем контекст кода (25 строк до и после)
+    const startLine = Math.max(0, comment.line - 25);
+    const endLine = Math.min(lines.length, comment.line + 25);
+    const codeContext = lines.slice(startLine, endLine).join('\n');
     // Извлекаем тип проблемы из родительского комментария
     const typeMatch = parentComment.body.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i);
     const type = typeMatch ? typeMatch[2].toLowerCase() : 'quality';
@@ -571,17 +428,21 @@ async function handleCommentReply(owner, repo, comment_id) {
                 {
                     role: 'system',
                     content: `Вы эксперт по проверке кода для React + TypeScript проектов.
-            Вы оставили комментарий о проблеме типа "${type}" в коде.
+            Вы оставили комментарий о проблеме типа "${type}" в следующем коде (строка ${comment.line}):
             
-            Оригинальный комментарий:
-            ${parentComment.body}
+            \`\`\`typescript
+            ${codeContext}
+            \`\`\`
             
-            Пользователь задал вопрос:
+            Ваш комментарий был:
+            ${parentComment.body.split('\n\n')[0]}\n${parentComment.body.split('\n\n')[1]}
+            
+            Пользователь задал вопрос об этой проблеме:
             ${question}
             
-            Ответьте на вопрос пользователя в контексте конкретной проблемы в коде.
-            Используйте технический, но понятный язык.
-            Если нужно, предложите конкретное решение проблемы.`,
+            Ответьте на вопрос пользователя, объясняя проблему в контексте конкретной строки кода.
+            Если пользователь просит показать как исправить, предложите конкретное решение с примером кода.
+            Используйте технический, но понятный язык.`,
                 },
                 {
                     role: 'user',
