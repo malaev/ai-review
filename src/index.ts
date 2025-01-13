@@ -80,6 +80,16 @@ interface ReviewComment {
   body: string;
 }
 
+interface AnalysisIssue {
+  line: number;
+  type: 'quality' | 'security' | 'performance';
+  description: string;
+}
+
+interface AnalysisResponse {
+  issues: AnalysisIssue[];
+}
+
 // Хранилище контекстов обсуждений
 const conversationContexts = new Map<string, ConversationContext>();
 
@@ -276,14 +286,14 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
 
   const content = Buffer.from(fileContent.content, 'base64').toString();
 
-  const systemPrompt = `Вы эксперт по проверке кода для React + TypeScript проектов. 
+  const systemPrompt = `Вы эксперт по проверке кода для React + TypeScript проектов.
     Проанализируйте следующий код и найдите проблемы в конкретных строках.
     Для каждой найденной проблемы укажите:
     1. Номер строки (line)
     2. Тип проблемы (type: 'quality' | 'security' | 'performance')
     3. Описание проблемы (description)
     
-    Формат ответа должен быть в виде JSON:
+    ВАЖНО: Ответ должен быть строго в формате JSON без дополнительных пояснений:
     {
       "issues": [
         {
@@ -294,6 +304,7 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
       ]
     }
     
+    Не добавляйте никаких пояснений или текста до или после JSON.
     Учитывайте весь контекст файла при анализе.`;
 
   const response = await withRetry(() => fetch(DEEPSEEK_API_URL, {
@@ -325,13 +336,33 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
   }
 
   const data = await response.json() as { choices: [{ message: { content: string } }] };
-  const analysis = JSON.parse(data.choices[0].message.content);
+  let analysis;
 
-  return analysis.issues.map((issue: { line: number, type: string, description: string }) => ({
-    path: file.filename,
-    line: issue.line,
-    body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}`
-  }));
+  try {
+    analysis = JSON.parse(data.choices[0].message.content) as AnalysisResponse;
+  } catch (error) {
+    console.error('Failed to parse DeepSeek response:', error);
+    console.log('Raw response:', data.choices[0].message.content);
+    // Возвращаем пустой массив комментариев в случае ошибки
+    return [];
+  }
+
+  if (!analysis.issues || !Array.isArray(analysis.issues)) {
+    console.error('Invalid analysis format:', analysis);
+    return [];
+  }
+
+  return analysis.issues
+    .filter((issue): issue is AnalysisIssue =>
+      typeof issue.line === 'number' &&
+      typeof issue.type === 'string' &&
+      typeof issue.description === 'string'
+    )
+    .map(issue => ({
+      path: file.filename,
+      line: issue.line,
+      body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}`
+    }));
 }
 
 async function commentOnPR(prInfo: PullRequestInfo) {

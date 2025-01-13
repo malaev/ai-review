@@ -231,14 +231,14 @@ async function analyzeFile(file, prInfo) {
         throw new Error('File content not found');
     }
     const content = Buffer.from(fileContent.content, 'base64').toString();
-    const systemPrompt = `Вы эксперт по проверке кода для React + TypeScript проектов. 
+    const systemPrompt = `Вы эксперт по проверке кода для React + TypeScript проектов.
     Проанализируйте следующий код и найдите проблемы в конкретных строках.
     Для каждой найденной проблемы укажите:
     1. Номер строки (line)
     2. Тип проблемы (type: 'quality' | 'security' | 'performance')
     3. Описание проблемы (description)
     
-    Формат ответа должен быть в виде JSON:
+    ВАЖНО: Ответ должен быть строго в формате JSON без дополнительных пояснений:
     {
       "issues": [
         {
@@ -249,6 +249,7 @@ async function analyzeFile(file, prInfo) {
       ]
     }
     
+    Не добавляйте никаких пояснений или текста до или после JSON.
     Учитывайте весь контекст файла при анализе.`;
     const response = await withRetry(() => (0, node_fetch_1.default)(DEEPSEEK_API_URL, {
         method: 'POST',
@@ -277,8 +278,25 @@ async function analyzeFile(file, prInfo) {
         throw new Error(`DeepSeek API error: ${response.statusText}`);
     }
     const data = await response.json();
-    const analysis = JSON.parse(data.choices[0].message.content);
-    return analysis.issues.map((issue) => ({
+    let analysis;
+    try {
+        analysis = JSON.parse(data.choices[0].message.content);
+    }
+    catch (error) {
+        console.error('Failed to parse DeepSeek response:', error);
+        console.log('Raw response:', data.choices[0].message.content);
+        // Возвращаем пустой массив комментариев в случае ошибки
+        return [];
+    }
+    if (!analysis.issues || !Array.isArray(analysis.issues)) {
+        console.error('Invalid analysis format:', analysis);
+        return [];
+    }
+    return analysis.issues
+        .filter((issue) => typeof issue.line === 'number' &&
+        typeof issue.type === 'string' &&
+        typeof issue.description === 'string')
+        .map(issue => ({
         path: file.filename,
         line: issue.line,
         body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}`
