@@ -286,8 +286,25 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
 
   const content = Buffer.from(fileContent.content, 'base64').toString();
 
-  const systemPrompt = `Вы эксперт по проверке кода для React + TypeScript проектов.
-    Проанализируйте следующий код и найдите проблемы в конкретных строках.
+  const systemPrompt = `Вы опытный ревьюер React + TypeScript проектов.
+    Проанализируйте код и найдите только серьезные проблемы, которые могут привести к багам или проблемам с производительностью.
+    
+    НЕ НУЖНО комментировать:
+    - Стилистические проблемы
+    - Отсутствие типов там, где они очевидны из контекста
+    - Использование console.log
+    - Мелкие предупреждения линтера
+    - Отсутствие документации
+    - Форматирование кода
+    
+    Сфокусируйтесь на:
+    - Утечках памяти
+    - Неправильном использовании React хуков
+    - Потенциальных race conditions
+    - Проблемах безопасности
+    - Серьезных проблемах производительности
+    - Логических ошибках в бизнес-логике
+    
     Для каждой найденной проблемы укажите:
     1. Номер строки (line)
     2. Тип проблемы (type: 'quality' | 'security' | 'performance')
@@ -302,10 +319,7 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
           "description": "string"
         }
       ]
-    }
-    
-    Не добавляйте никаких пояснений или текста до или после JSON.
-    Учитывайте весь контекст файла при анализе.`;
+    }`;
 
   const response = await withRetry(() => fetch(DEEPSEEK_API_URL, {
     method: 'POST',
@@ -327,7 +341,7 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
       ],
       response_format: { type: 'json_object' },
       temperature: 0.3,
-      max_tokens: 2000,
+      max_tokens: 4000,
     }),
   }));
 
@@ -365,9 +379,20 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
     }));
 }
 
+interface GitHubError extends Error {
+  status?: number;
+}
+
 async function commentOnPR(prInfo: PullRequestInfo) {
   // Получаем файлы, измененные в PR
   const { data: files } = await withRetry(() => octokit.pulls.listFiles({
+    owner: prInfo.owner,
+    repo: prInfo.repo,
+    pull_number: prInfo.pull_number,
+  }));
+
+  // Получаем diff для каждого файла
+  const { data: pr } = await withRetry(() => octokit.pulls.get({
     owner: prInfo.owner,
     repo: prInfo.repo,
     pull_number: prInfo.pull_number,
@@ -380,16 +405,60 @@ async function commentOnPR(prInfo: PullRequestInfo) {
       .map(file => analyzeFile(file, prInfo))
   );
 
-  // Создаем ревью со всеми комментариями
-  const { data: review } = await withRetry(() => octokit.pulls.createReview({
-    owner: prInfo.owner,
-    repo: prInfo.repo,
-    pull_number: prInfo.pull_number,
-    event: 'COMMENT',
-    comments: allComments.flat(),
-  }));
+  // Фильтруем комментарии, оставляя только те, которые относятся к измененным строкам
+  const validComments = allComments.flat().filter(comment => {
+    const file = files.find(f => f.filename === comment.path);
+    if (!file || !file.patch) return false;
 
-  console.log(`Created review: ${review.html_url}`);
+    // Парсим diff чтобы получить измененные строки
+    const changedLines = new Set<number>();
+    const diffLines = file.patch.split('\n');
+    let currentLine = 0;
+
+    for (const line of diffLines) {
+      if (line.startsWith('@@')) {
+        const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        if (match) {
+          currentLine = parseInt(match[1], 10) - 1;
+        }
+        continue;
+      }
+
+      if (line.startsWith('+')) {
+        changedLines.add(currentLine);
+      }
+      if (!line.startsWith('-')) {
+        currentLine++;
+      }
+    }
+
+    return changedLines.has(comment.line);
+  });
+
+  if (validComments.length === 0) {
+    console.log('No valid comments to create');
+    return;
+  }
+
+  // Создаем ревью только с комментариями к измененным строкам
+  try {
+    const { data: review } = await withRetry(() => octokit.pulls.createReview({
+      owner: prInfo.owner,
+      repo: prInfo.repo,
+      pull_number: prInfo.pull_number,
+      event: 'COMMENT',
+      comments: validComments,
+    }));
+    console.log(`Created review: ${review.html_url}`);
+  } catch (error: unknown) {
+    const githubError = error as GitHubError;
+    if (githubError.status === 422) {
+      console.error('Failed to create review. Some comments might be outside of the diff.');
+      console.log('Valid comments:', validComments);
+    } else {
+      throw error;
+    }
+  }
 }
 
 function formatAnalysisComment(analysis: CodeAnalysis): string {

@@ -231,8 +231,25 @@ async function analyzeFile(file, prInfo) {
         throw new Error('File content not found');
     }
     const content = Buffer.from(fileContent.content, 'base64').toString();
-    const systemPrompt = `Вы эксперт по проверке кода для React + TypeScript проектов.
-    Проанализируйте следующий код и найдите проблемы в конкретных строках.
+    const systemPrompt = `Вы опытный ревьюер React + TypeScript проектов.
+    Проанализируйте код и найдите только серьезные проблемы, которые могут привести к багам или проблемам с производительностью.
+    
+    НЕ НУЖНО комментировать:
+    - Стилистические проблемы
+    - Отсутствие типов там, где они очевидны из контекста
+    - Использование console.log
+    - Мелкие предупреждения линтера
+    - Отсутствие документации
+    - Форматирование кода
+    
+    Сфокусируйтесь на:
+    - Утечках памяти
+    - Неправильном использовании React хуков
+    - Потенциальных race conditions
+    - Проблемах безопасности
+    - Серьезных проблемах производительности
+    - Логических ошибках в бизнес-логике
+    
     Для каждой найденной проблемы укажите:
     1. Номер строки (line)
     2. Тип проблемы (type: 'quality' | 'security' | 'performance')
@@ -247,10 +264,7 @@ async function analyzeFile(file, prInfo) {
           "description": "string"
         }
       ]
-    }
-    
-    Не добавляйте никаких пояснений или текста до или после JSON.
-    Учитывайте весь контекст файла при анализе.`;
+    }`;
     const response = await withRetry(() => (0, node_fetch_1.default)(DEEPSEEK_API_URL, {
         method: 'POST',
         headers: {
@@ -271,7 +285,7 @@ async function analyzeFile(file, prInfo) {
             ],
             response_format: { type: 'json_object' },
             temperature: 0.3,
-            max_tokens: 2000,
+            max_tokens: 4000,
         }),
     }));
     if (!response.ok) {
@@ -309,19 +323,67 @@ async function commentOnPR(prInfo) {
         repo: prInfo.repo,
         pull_number: prInfo.pull_number,
     }));
+    // Получаем diff для каждого файла
+    const { data: pr } = await withRetry(() => octokit.pulls.get({
+        owner: prInfo.owner,
+        repo: prInfo.repo,
+        pull_number: prInfo.pull_number,
+    }));
     // Анализируем каждый файл и собираем комментарии
     const allComments = await Promise.all(files
         .filter(file => file.filename.match(/\.(ts|tsx|js|jsx)$/))
         .map(file => analyzeFile(file, prInfo)));
-    // Создаем ревью со всеми комментариями
-    const { data: review } = await withRetry(() => octokit.pulls.createReview({
-        owner: prInfo.owner,
-        repo: prInfo.repo,
-        pull_number: prInfo.pull_number,
-        event: 'COMMENT',
-        comments: allComments.flat(),
-    }));
-    console.log(`Created review: ${review.html_url}`);
+    // Фильтруем комментарии, оставляя только те, которые относятся к измененным строкам
+    const validComments = allComments.flat().filter(comment => {
+        const file = files.find(f => f.filename === comment.path);
+        if (!file || !file.patch)
+            return false;
+        // Парсим diff чтобы получить измененные строки
+        const changedLines = new Set();
+        const diffLines = file.patch.split('\n');
+        let currentLine = 0;
+        for (const line of diffLines) {
+            if (line.startsWith('@@')) {
+                const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                if (match) {
+                    currentLine = parseInt(match[1], 10) - 1;
+                }
+                continue;
+            }
+            if (line.startsWith('+')) {
+                changedLines.add(currentLine);
+            }
+            if (!line.startsWith('-')) {
+                currentLine++;
+            }
+        }
+        return changedLines.has(comment.line);
+    });
+    if (validComments.length === 0) {
+        console.log('No valid comments to create');
+        return;
+    }
+    // Создаем ревью только с комментариями к измененным строкам
+    try {
+        const { data: review } = await withRetry(() => octokit.pulls.createReview({
+            owner: prInfo.owner,
+            repo: prInfo.repo,
+            pull_number: prInfo.pull_number,
+            event: 'COMMENT',
+            comments: validComments,
+        }));
+        console.log(`Created review: ${review.html_url}`);
+    }
+    catch (error) {
+        const githubError = error;
+        if (githubError.status === 422) {
+            console.error('Failed to create review. Some comments might be outside of the diff.');
+            console.log('Valid comments:', validComments);
+        }
+        else {
+            throw error;
+        }
+    }
 }
 function formatAnalysisComment(analysis) {
     if (!analysis.quality?.length && !analysis.security?.length && !analysis.performance?.length) {
