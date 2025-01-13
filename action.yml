@@ -9,7 +9,7 @@ inputs:
   deepseek-api-key:
     description: 'DeepSeek API key'
     required: true
-  github-token:
+  GITHUB_TOKEN:
     description: 'GitHub token (provided automatically)'
     required: true
     default: ${{ github.token }}
