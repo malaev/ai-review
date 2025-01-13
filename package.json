@@ -5,8 +5,9 @@
   "main": "src/index.ts",
   "scripts": {
     "build": "tsc",
+    "package": "npm run build && cp package.json package-lock.json action.yml README.md dist/ && cd dist && npm ci --omit=dev",
+    "lint": "eslint . --ext .ts",
     "test": "jest",
-    "lint": "eslint src/**/*.ts",
     "review": "node dist/index.js",
     "prepare": "npm run build",
     "test:local": "ts-node scripts/test-locally.ts"
