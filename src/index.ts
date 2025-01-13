@@ -339,7 +339,7 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
         return {
           path: file.filename,
           line: match.lineNumber,
-          body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, нажмите на три точки (⋯), выберите "Quote reply" и начните текст с @ai или /ai*`
+          body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, начните текст с @ai или /ai*`
         };
       })
       .filter((comment): comment is ReviewComment => comment !== null);
@@ -579,7 +579,7 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
     owner,
     repo,
     pull_number: prNumber,
-    body: `> ${question}\n\n${answer}\n\n*Чтобы задать еще вопрос, нажмите на три точки (⋯), выберите "Quote reply" и начните текст с @ai или /ai*`,
+    body: `> ${question}\n\n${answer}\n\n*Чтобы задать еще вопрос, начните текст с @ai или /ai`,
     commit_id: pr.head.sha,
     path: comment.path,
     line: comment.line,
