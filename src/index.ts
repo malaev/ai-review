@@ -1,6 +1,17 @@
 import { Octokit } from '@octokit/rest';
-import 'dotenv/config';
+import * as dotenv from 'dotenv';
 import fetch from 'node-fetch';
+
+// Загружаем переменные окружения
+dotenv.config();
+
+if (!process.env.GITHUB_TOKEN) {
+  throw new Error('GITHUB_TOKEN is required');
+}
+
+if (!process.env.DEEPSEEK_API_KEY) {
+  throw new Error('DEEPSEEK_API_KEY is required');
+}
 
 const octokit = new Octokit({
   auth: process.env.GITHUB_TOKEN,
@@ -8,6 +19,10 @@ const octokit = new Octokit({
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
+
+// Максимальное количество попыток для API запросов
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000;
 
 interface PullRequestInfo {
   owner: string;
@@ -43,7 +58,28 @@ interface ConversationContext {
 // Хранилище контекстов обсуждений
 const conversationContexts = new Map<string, ConversationContext>();
 
+// Утилита для задержки
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Утилита для повторных попыток
+async function withRetry<T>(operation: () => Promise<T>, retries = MAX_RETRIES): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (retries > 0) {
+      console.log(`Повторная попытка (осталось ${retries})...`);
+      await delay(RETRY_DELAY);
+      return withRetry(operation, retries - 1);
+    }
+    throw error;
+  }
+}
+
 function chunkDiff(diff: string, maxChunkSize: number = 4000): string[] {
+  if (!diff) {
+    throw new Error('Diff is empty');
+  }
+
   const lines = diff.split('\n');
   const chunks: string[] = [];
   let currentChunk: string[] = [];
@@ -67,14 +103,14 @@ function chunkDiff(diff: string, maxChunkSize: number = 4000): string[] {
 }
 
 async function getDiff({ owner, repo, pull_number }: PullRequestInfo): Promise<string> {
-  const response = await octokit.pulls.get({
+  const response = await withRetry(() => octokit.pulls.get({
     owner,
     repo,
     pull_number,
     mediaType: {
       format: 'diff',
     },
-  });
+  }));
 
   if (typeof response.data === 'string') {
     return response.data;
@@ -85,35 +121,33 @@ async function getDiff({ owner, repo, pull_number }: PullRequestInfo): Promise<s
 
 async function getCommentContext(owner: string, repo: string, comment_id: number): Promise<ConversationContext | null> {
   try {
-    // Получаем информацию о комментарии
-    const { data: comment } = await octokit.issues.getComment({
+    const { data: comment } = await withRetry(() => octokit.issues.getComment({
       owner,
       repo,
       comment_id,
-    });
+    }));
 
-    if (!comment.body) {
+    if (!comment?.body) {
+      console.log('Comment body is empty');
       return null;
     }
 
-    // Получаем связанный PR
     const prNumber = comment.issue_url.split('/').pop();
     if (!prNumber) {
+      console.log('Could not extract PR number from URL');
       return null;
     }
 
-    const { data: pr } = await octokit.pulls.get({
+    const { data: pr } = await withRetry(() => octokit.pulls.get({
       owner,
       repo,
       pull_number: parseInt(prNumber, 10),
-    });
+    }));
 
-    // Извлекаем контекст из хранилища или создаем новый
     const contextKey = `${pr.number}-${comment_id}`;
     let context = conversationContexts.get(contextKey);
 
     if (!context) {
-      // Парсим комментарий для получения информации о коде
       const codeMatch = comment.body.match(/\`\`\`[\s\S]*?\`\`\`/);
       if (codeMatch) {
         context = {
@@ -138,6 +172,10 @@ async function getCommentContext(owner: string, repo: string, comment_id: number
 }
 
 async function analyzeCodeWithDeepSeek(chunk: string, context?: ConversationContext): Promise<string> {
+  if (!chunk) {
+    throw new Error('Empty chunk provided for analysis');
+  }
+
   const systemPrompt = context
     ? `Вы эксперт по проверке кода для React + TypeScript проектов. Вы участвуете в обсуждении кода. 
        Контекст обсуждения:
@@ -162,7 +200,7 @@ async function analyzeCodeWithDeepSeek(chunk: string, context?: ConversationCont
          "performance": ["пункт 1", "пункт 2", ...]
        }`;
 
-  const response = await fetch(DEEPSEEK_API_URL, {
+  const response = await withRetry(() => fetch(DEEPSEEK_API_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -184,45 +222,63 @@ async function analyzeCodeWithDeepSeek(chunk: string, context?: ConversationCont
       temperature: 0.3,
       max_tokens: 2000,
     }),
-  });
+  }));
 
   if (!response.ok) {
     throw new Error(`DeepSeek API error: ${response.statusText}`);
   }
 
   const data = await response.json() as DeepSeekResponse;
+  if (!data.choices?.[0]?.message?.content) {
+    throw new Error('Invalid response from DeepSeek API');
+  }
+
   return data.choices[0].message.content;
 }
 
 async function commentOnPR(prInfo: PullRequestInfo, analysis: CodeAnalysis) {
   const comment = formatAnalysisComment(analysis);
-  await octokit.issues.createComment({
+  await withRetry(() => octokit.issues.createComment({
     owner: prInfo.owner,
     repo: prInfo.repo,
     issue_number: prInfo.pull_number,
     body: comment,
-  });
+  }));
 }
 
 function formatAnalysisComment(analysis: CodeAnalysis): string {
+  if (!analysis.quality?.length && !analysis.security?.length && !analysis.performance?.length) {
+    return `## 🤖 AI Code Review
+
+Код выглядит хорошо! Я не нашел существенных проблем.
+
+---
+*Этот отзыв был сгенерирован автоматически с помощью AI Code Review.*`;
+  }
+
   return `## 🤖 AI Code Review
 
-### 📝 Качество кода
-${analysis.quality.map(item => `- ${item}`).join('\n')}
+${analysis.quality.length ? `### 📝 Качество кода
+${analysis.quality.map(item => `- ${item}`).join('\n')}` : ''}
 
-### 🔒 Безопасность
-${analysis.security.map(item => `- ${item}`).join('\n')}
+${analysis.security.length ? `### 🔒 Безопасность
+${analysis.security.map(item => `- ${item}`).join('\n')}` : ''}
 
-### ⚡ Производительность
-${analysis.performance.map(item => `- ${item}`).join('\n')}
+${analysis.performance.length ? `### ⚡ Производительность
+${analysis.performance.map(item => `- ${item}`).join('\n')}` : ''}
 
 ---
 *Этот отзыв был сгенерирован автоматически с помощью AI Code Review.*`;
 }
 
 async function handlePRReview(prInfo: PullRequestInfo) {
+  console.log(`Анализирую PR #${prInfo.pull_number}...`);
+
   const diff = await getDiff(prInfo);
   const chunks = chunkDiff(diff);
+
+  console.log(`Разбил diff на ${chunks.length} частей`);
+
   const analyses = await Promise.all(chunks.map(chunk => analyzeCodeWithDeepSeek(chunk)));
 
   const analysis = analyses.reduce((acc, curr) => {
@@ -234,38 +290,39 @@ async function handlePRReview(prInfo: PullRequestInfo) {
     };
   }, { quality: [], security: [], performance: [] } as CodeAnalysis);
 
+  console.log('Отправляю комментарий...');
   await commentOnPR(prInfo, analysis);
+  console.log('Готово!');
 }
 
 async function handleCommentReply(owner: string, repo: string, comment_id: number, reply_to_id: number) {
+  console.log(`Обрабатываю ответ на комментарий ${reply_to_id}...`);
+
   const context = await getCommentContext(owner, repo, reply_to_id);
   if (!context) {
     console.error('Could not find context for comment');
     return;
   }
 
-  // Получаем текст комментария пользователя
-  const { data: comment } = await octokit.issues.getComment({
+  const { data: comment } = await withRetry(() => octokit.issues.getComment({
     owner,
     repo,
     comment_id,
-  });
+  }));
 
-  if (!comment.body) {
+  if (!comment?.body) {
     console.error('Comment body is empty');
     return;
   }
 
-  // Добавляем комментарий пользователя в контекст
   context.messages.push({
     role: 'user',
     content: comment.body,
   });
 
-  // Получаем ответ от AI
+  console.log('Анализирую вопрос...');
   const response = await analyzeCodeWithDeepSeek(comment.body, context);
 
-  // Добавляем ответ в контекст
   context.messages.push({
     role: 'assistant',
     content: response,
@@ -276,13 +333,15 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
     throw new Error('Could not extract issue number from URL');
   }
 
-  // Отправляем ответ
-  await octokit.issues.createComment({
+  console.log('Отправляю ответ...');
+  await withRetry(() => octokit.issues.createComment({
     owner,
     repo,
     issue_number: parseInt(issueNumber, 10),
     body: response,
-  });
+  }));
+
+  console.log('Готово!');
 }
 
 async function main() {
@@ -291,10 +350,6 @@ async function main() {
 
   if (!owner || !repo) {
     throw new Error('Missing repository information');
-  }
-
-  if (!DEEPSEEK_API_KEY) {
-    throw new Error('DEEPSEEK_API_KEY is required');
   }
 
   try {
@@ -311,6 +366,8 @@ async function main() {
         throw new Error('Missing comment information');
       }
       await handleCommentReply(owner, repo, comment_id, reply_to_id);
+    } else {
+      throw new Error(`Unsupported event type: ${eventName}`);
     }
   } catch (error) {
     console.error('Error during code review:', error);

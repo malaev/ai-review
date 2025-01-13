@@ -1,2 +1,9 @@
-/node_modules
-/dist
+# Dependencies
+node_modules/
+.env
+.env.test
+
+# Testing
+test-workspace/
+coverage/
+*.log

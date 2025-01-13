@@ -7,8 +7,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
       
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -24,15 +29,19 @@ jobs:
         
       - name: Package
         run: |
-          cp action.yml package.json README.md dist/
+          mkdir -p dist
+          cp action.yml package.json package-lock.json README.md dist/
           cd dist
-          npm ci --production
+          # Устанавливаем все зависимости из package-lock.json
+          npm ci --omit=dev
           
-      - name: Push to release branch
+      - name: Commit dist
         run: |
-          git config --global user.name "GitHub Action"
-          git config --global user.email "action@github.com"
-          git checkout -b release
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
           git add -f dist/
-          git commit -m "Release ${{ github.ref }}"
-          git push origin release --force 
+          git commit -m "chore: add dist for ${{ github.ref }}"
+          git push origin main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
