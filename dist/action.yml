@@ -6,7 +6,7 @@ branding:
   color: 'blue' 
 
 inputs:
-  deepseek-api-key:
+  DEEPSEEK_API_KEY:
     description: 'DeepSeek API key'
     required: true
   GITHUB_TOKEN:
@@ -16,4 +16,7 @@ inputs:
 
 runs:
   using: 'node20'
-  main: 'dist/index.js' 
+  main: 'dist/index.js'
+  env:
+    GITHUB_TOKEN: ${{ inputs.GITHUB_TOKEN }}
+    DEEPSEEK_API_KEY: ${{ inputs.DEEPSEEK_API_KEY }} 
