@@ -33,6 +33,10 @@ inputs:
     description: 'Parent comment ID for reply handling'
     required: false
     default: ${{ github.event.comment.in_reply_to_id }}
+  DEBUG:
+    description: 'Enable debug logging'
+    required: false
+    default: 'true'
 
 runs:
   using: 'node20'

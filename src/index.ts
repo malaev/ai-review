@@ -736,13 +736,15 @@ async function main() {
   }
 
   try {
+    console.log('Event type:', eventName);
+
     if (eventName === 'pull_request') {
       const pull_number = Number(PR_NUMBER);
       if (isNaN(pull_number)) {
         throw new Error(`Invalid PR number: ${PR_NUMBER}`);
       }
       await handlePRReview({ owner, repo, pull_number });
-    } else if (eventName === 'issue_comment') {
+    } else if (eventName === 'pull_request_review_comment' || eventName === 'issue_comment') {
       const comment_id = Number(process.env.COMMENT_ID);
       if (!comment_id) {
         throw new Error('Missing comment ID');
