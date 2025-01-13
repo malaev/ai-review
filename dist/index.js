@@ -267,133 +267,154 @@ function findMostSimilarLine(targetLine, fileLines, startLine, endLine) {
     return bestMatch.similarity < 0.5 ? bestMatch.lineNumber : startLine;
 }
 async function analyzeFile(file, prInfo) {
-    // Получаем содержимое файла
-    const { data: fileContent } = await withRetry(() => octokit.repos.getContent({
-        owner: prInfo.owner,
-        repo: prInfo.repo,
-        path: file.filename,
-        ref: `pull/${prInfo.pull_number}/head`,
-    }));
-    if (!('content' in fileContent)) {
-        throw new Error('File content not found');
-    }
-    const content = Buffer.from(fileContent.content, 'base64').toString();
-    const lines = content.split('\n');
-    // Создаем карту соответствия строк в файле и в diff
-    const lineMap = new Map();
-    if (file.patch) {
-        const diffLines = file.patch.split('\n');
-        let fileLineNum = 0;
-        let diffLineNum = 0;
-        for (const line of diffLines) {
-            if (line.startsWith('@@')) {
-                const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-                if (match) {
-                    fileLineNum = parseInt(match[1], 10) - 1;
-                }
-                continue;
-            }
-            if (!line.startsWith('-')) {
-                lineMap.set(fileLineNum + 1, diffLineNum + 1);
-                fileLineNum++;
-            }
-            diffLineNum++;
-        }
-    }
-    const systemPrompt = `Вы опытный ревьюер React + TypeScript проектов.
-    Проанализируйте код и найдите только серьезные проблемы, которые могут привести к багам или проблемам с производительностью.
-    
-    НЕ НУЖНО комментировать:
-    - Стилистические проблемы
-    - Отсутствие типов там, где они очевидны из контекста
-    - Использование console.log
-    - Мелкие предупреждения линтера
-    - Отсутствие документации
-    - Форматирование кода
-    
-    Сфокусируйтесь на:
-    - Утечках памяти
-    - Неправильном использовании React хуков
-    - Потенциальных race conditions
-    - Проблемах безопасности
-    - Серьезных проблемах производительности
-    - Логических ошибках в бизнес-логике
-    
-    ВАЖНО: Для каждой проблемы обязательно укажите:
-    1. Точный номер строки (line)
-    2. Саму проблемную строку кода (code)
-    3. Тип проблемы (type)
-    4. Описание проблемы (description)
-    
-    Формат ответа:
-    {
-      "issues": [
-        {
-          "line": number,
-          "code": "string", // Точная строка кода с проблемой
-          "type": "quality" | "security" | "performance",
-          "description": "string"
-        }
-      ]
-    }`;
-    const response = await withRetry(() => (0, node_fetch_1.default)(DEEPSEEK_API_URL, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-        },
-        body: JSON.stringify({
-            model: 'deepseek-chat',
-            messages: [
-                {
-                    role: 'system',
-                    content: systemPrompt,
-                },
-                {
-                    role: 'user',
-                    content: content,
-                },
-            ],
-            response_format: { type: 'json_object' },
-            temperature: 0.3,
-            max_tokens: 4000,
-        }),
-    }));
-    if (!response.ok) {
-        throw new Error(`DeepSeek API error: ${response.statusText}`);
-    }
-    const data = await response.json();
-    let analysis;
     try {
-        analysis = JSON.parse(data.choices[0].message.content);
+        // Получаем содержимое файла
+        const { data: fileContent } = await withRetry(() => octokit.repos.getContent({
+            owner: prInfo.owner,
+            repo: prInfo.repo,
+            path: file.filename,
+            ref: `pull/${prInfo.pull_number}/head`,
+        }));
+        if (!('content' in fileContent)) {
+            throw new Error('File content not found');
+        }
+        let content = Buffer.from(fileContent.content, 'base64').toString();
+        // Проверяем размер контента
+        if (content.length > 30000) {
+            console.log(`File ${file.filename} is too large (${content.length} chars), analyzing first 30000 chars`);
+            content = content.slice(0, 30000);
+        }
+        const lines = content.split('\n');
+        // Создаем карту соответствия строк в файле и в diff
+        const lineMap = new Map();
+        if (file.patch) {
+            const diffLines = file.patch.split('\n');
+            let fileLineNum = 0;
+            let diffLineNum = 0;
+            for (const line of diffLines) {
+                if (line.startsWith('@@')) {
+                    const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                    if (match) {
+                        fileLineNum = parseInt(match[1], 10) - 1;
+                    }
+                    continue;
+                }
+                if (!line.startsWith('-')) {
+                    lineMap.set(fileLineNum + 1, diffLineNum + 1);
+                    fileLineNum++;
+                }
+                diffLineNum++;
+            }
+        }
+        const systemPrompt = `Вы опытный ревьюер React + TypeScript проектов.
+      Проанализируйте код и найдите только серьезные проблемы, которые могут привести к багам или проблемам с производительностью.
+      
+      НЕ НУЖНО комментировать:
+      - Стилистические проблемы
+      - Отсутствие типов там, где они очевидны из контекста
+      - Использование console.log
+      - Мелкие предупреждения линтера
+      - Отсутствие документации
+      - Форматирование кода
+      
+      Сфокусируйтесь на:
+      - Утечках памяти
+      - Неправильном использовании React хуков
+      - Потенциальных race conditions
+      - Проблемах безопасности
+      - Серьезных проблемах производительности
+      - Логических ошибках в бизнес-логике
+      
+      ВАЖНО: Для каждой проблемы обязательно укажите:
+      1. Точный номер строки (line)
+      2. Саму проблемную строку кода (code)
+      3. Тип проблемы (type)
+      4. Описание проблемы (description)
+      
+      Формат ответа:
+      {
+        "issues": [
+          {
+            "line": number,
+            "code": "string", // Точная строка кода с проблемой
+            "type": "quality" | "security" | "performance",
+            "description": "string"
+          }
+        ]
+      }`;
+        const response = await withRetry(() => (0, node_fetch_1.default)(DEEPSEEK_API_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+            },
+            body: JSON.stringify({
+                model: 'deepseek-chat',
+                messages: [
+                    {
+                        role: 'system',
+                        content: systemPrompt,
+                    },
+                    {
+                        role: 'user',
+                        content: content,
+                    },
+                ],
+                response_format: { type: 'json_object' },
+                temperature: 0.3,
+                max_tokens: 4000,
+            }),
+        }));
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('DeepSeek API error details:', {
+                status: response.status,
+                statusText: response.statusText,
+                headers: Object.fromEntries(response.headers.entries()),
+                body: errorText,
+            });
+            throw new Error(`DeepSeek API error: ${response.status} ${response.statusText}\n${errorText}`);
+        }
+        const data = await response.json();
+        let analysis;
+        try {
+            analysis = JSON.parse(data.choices[0].message.content);
+        }
+        catch (error) {
+            console.error('Failed to parse DeepSeek response:', error);
+            console.log('Raw response:', data.choices[0].message.content);
+            return [];
+        }
+        if (!analysis.issues || !Array.isArray(analysis.issues)) {
+            console.error('Invalid analysis format:', analysis);
+            return [];
+        }
+        // Разбиваем файл на строки для поиска
+        const fileLines = content.split('\n');
+        return analysis.issues
+            .filter((issue) => typeof issue.line === 'number' &&
+            typeof issue.code === 'string' &&
+            typeof issue.type === 'string' &&
+            typeof issue.description === 'string')
+            .map(issue => {
+            // Ищем наиболее похожую строку
+            const actualLine = findMostSimilarLine(issue.code, fileLines, Math.max(0, issue.line - 30), // Начинаем поиск за 10 строк до
+            Math.min(fileLines.length, issue.line + 30) // Заканчиваем через 10 строк после
+            );
+            return {
+                path: file.filename,
+                line: actualLine,
+                body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, ответьте на этот комментарий.*`
+            };
+        });
     }
     catch (error) {
-        console.error('Failed to parse DeepSeek response:', error);
-        console.log('Raw response:', data.choices[0].message.content);
+        console.error(`Error analyzing file ${file.filename}:`, error);
+        if (error instanceof Error) {
+            console.error('Error stack:', error.stack);
+        }
         return [];
     }
-    if (!analysis.issues || !Array.isArray(analysis.issues)) {
-        console.error('Invalid analysis format:', analysis);
-        return [];
-    }
-    // Разбиваем файл на строки для поиска
-    const fileLines = content.split('\n');
-    return analysis.issues
-        .filter((issue) => typeof issue.line === 'number' &&
-        typeof issue.code === 'string' &&
-        typeof issue.type === 'string' &&
-        typeof issue.description === 'string')
-        .map(issue => {
-        // Ищем наиболее похожую строку
-        const actualLine = findMostSimilarLine(issue.code, fileLines, Math.max(0, issue.line - 30), // Начинаем поиск за 10 строк до
-        Math.min(fileLines.length, issue.line + 30) // Заканчиваем через 10 строк после
-        );
-        return {
-            path: file.filename,
-            line: actualLine,
-            body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, ответьте на этот комментарий.*`
-        };
-    });
 }
 async function commentOnPR(prInfo) {
     // Получаем файлы, измененные в PR
