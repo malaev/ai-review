@@ -625,15 +625,15 @@ async function handlePRReview(prInfo: PullRequestInfo) {
 async function handleCommentReply(owner: string, repo: string, comment_id: number) {
   console.log(`Обрабатываю комментарий ${comment_id}...`);
 
-  // Получаем комментарий с вопросом
-  const { data: comment } = await withRetry(() => octokit.issues.getComment({
+  // Получаем review comment
+  const { data: comment } = await withRetry(() => octokit.pulls.getReviewComment({
     owner,
     repo,
     comment_id,
   }));
 
-  if (!comment?.body) {
-    console.error('Comment body is empty');
+  if (!comment?.body || !comment.pull_request_url) {
+    console.error('Comment body or PR URL is empty');
     return;
   }
 
@@ -643,16 +643,23 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
     return;
   }
 
-  // Получаем контекст из родительского комментария
-  const threadResponse = await withRetry(() => octokit.issues.listComments({
+  // Получаем номер PR
+  const prNumber = Number(comment.pull_request_url.split('/').pop());
+  if (!prNumber) {
+    console.error('Could not extract PR number from URL');
+    return;
+  }
+
+  // Получаем все review comments в PR
+  const { data: reviewComments } = await withRetry(() => octokit.pulls.listReviewComments({
     owner,
     repo,
-    issue_number: Number(comment.issue_url.split('/').pop()),
+    pull_number: prNumber,
     per_page: 100,
   }));
 
   // Ищем родительский комментарий от бота
-  const parentComment = threadResponse.data
+  const parentComment = reviewComments
     .reverse()
     .find(c =>
       c.id < comment.id &&
@@ -664,26 +671,12 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
     return;
   }
 
-  // Извлекаем контекст из родительского комментария
+  // Извлекаем тип проблемы из родительского комментария
   const typeMatch = parentComment.body.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i);
   const type = typeMatch ? typeMatch[2].toLowerCase() : 'quality';
 
   // Убираем @ai или /ai из вопроса
   const question = comment.body.replace(/^(@ai|\/ai)\s+/i, '');
-
-  // Формируем промпт с контекстом
-  const systemPrompt = `Вы эксперт по проверке кода для React + TypeScript проектов.
-    Вы оставили комментарий о проблеме типа "${type}" в коде.
-    
-    Оригинальный комментарий:
-    ${parentComment.body}
-    
-    Пользователь задал вопрос:
-    ${question}
-    
-    Ответьте на вопрос пользователя в контексте конкретной проблемы в коде.
-    Используйте технический, но понятный язык.
-    Если нужно, предложите конкретное решение проблемы.`;
 
   console.log('Анализирую вопрос...');
   const response = await withRetry(() => fetch(DEEPSEEK_API_URL, {
@@ -697,7 +690,18 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
       messages: [
         {
           role: 'system',
-          content: systemPrompt,
+          content: `Вы эксперт по проверке кода для React + TypeScript проектов.
+            Вы оставили комментарий о проблеме типа "${type}" в коде.
+            
+            Оригинальный комментарий:
+            ${parentComment.body}
+            
+            Пользователь задал вопрос:
+            ${question}
+            
+            Ответьте на вопрос пользователя в контексте конкретной проблемы в коде.
+            Используйте технический, но понятный язык.
+            Если нужно, предложите конкретное решение проблемы.`,
         },
         {
           role: 'user',
@@ -717,11 +721,23 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
   const answer = data.choices[0].message.content;
 
   console.log('Отправляю ответ...');
-  await withRetry(() => octokit.issues.createComment({
+
+  // Получаем информацию о PR для создания review comment
+  const { data: pr } = await withRetry(() => octokit.pulls.get({
     owner,
     repo,
-    issue_number: Number(comment.issue_url.split('/').pop()),
-    body: `> ${question}\n\n${answer}\n\n*Чтобы задать еще вопрос, начните комментарий с @ai или /ai*`,
+    pull_number: prNumber,
+  }));
+
+  await withRetry(() => octokit.pulls.createReviewComment({
+    owner,
+    repo,
+    pull_number: prNumber,
+    body: `> ${question}\n\n${answer}\n\n*Чтобы задать еще вопрос, нажмите на три точки (⋯), выберите "Quote reply" и начните текст с @ai или /ai*`,
+    commit_id: pr.head.sha,
+    path: comment.path,
+    line: comment.line,
+    in_reply_to: comment.id,
   }));
 
   console.log('Готово!');
@@ -744,14 +760,14 @@ async function main() {
         throw new Error(`Invalid PR number: ${PR_NUMBER}`);
       }
       await handlePRReview({ owner, repo, pull_number });
-    } else if (eventName === 'pull_request_review_comment' || eventName === 'issue_comment') {
+    } else if (eventName === 'pull_request_review_comment') {
       const comment_id = Number(process.env.COMMENT_ID);
       if (!comment_id) {
         throw new Error('Missing comment ID');
       }
       await handleCommentReply(owner, repo, comment_id);
     } else {
-      throw new Error(`Unsupported event type: ${eventName}`);
+      console.log(`Ignoring event type: ${eventName}`);
     }
   } catch (error) {
     console.error('Error during code review:', error);

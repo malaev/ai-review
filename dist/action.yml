@@ -41,3 +41,8 @@ inputs:
 runs:
   using: 'node20'
   main: 'dist/index.js'
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
