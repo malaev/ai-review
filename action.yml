@@ -1,20 +1,19 @@
-name: 'AI Code Review'
-description: 'Автоматический анализ кода в Pull Request с помощью DeepSeek AI'
-author: 'Your Name'
-
-inputs:
-  github-token:
-    description: 'GitHub токен для доступа к PR'
-    required: true
-    default: ${{ github.token }}
-  deepseek-api-key:
-    description: 'API ключ DeepSeek'
-    required: true
-
-runs:
-  using: 'node20'
-  main: 'dist/index.js'
-
+name: 'lev-p-ai-review'
+description: 'Automatic code review for React + TypeScript projects'
+author: 'lev-p'
 branding:
   icon: 'code'
   color: 'blue' 
+
+inputs:
+  deepseek-api-key:
+    description: 'DeepSeek API key'
+    required: true
+  github-token:
+    description: 'GitHub token (provided automatically)'
+    required: true
+    default: ${{ github.token }}
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js' 

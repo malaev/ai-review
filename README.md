@@ -17,6 +17,8 @@ on:
       - '**.tsx'
       - '**.js'
       - '**.jsx'
+  issue_comment:
+    types: [created]
 
 jobs:
   review:
@@ -28,15 +30,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - uses: your-username/ai-review@v1
+      - uses: malaev/ai-review@v1
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+          # github-token предоставляется автоматически
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-2. Добавьте секрет `DEEPSEEK_API_KEY` в настройках вашего репозитория (Settings -> Secrets and variables -> Actions)
+2. Добавьте секрет `DEEPSEEK_API_KEY` в настройках вашего репозитория:
+   - Перейдите в Settings -> Secrets and variables -> Actions
+   - Нажмите "New repository secret"
+   - Имя: `DEEPSEEK_API_KEY`
+   - Значение: ваш API ключ от DeepSeek
 
-3. Готово! Теперь при создании или обновлении PR бот будет автоматически проводить ревью кода
+3. Готово! Теперь при создании или обновлении PR бот будет автоматически проводить ревью кода и отвечать на комментарии.
 
 ## Как это работает
 
@@ -53,11 +60,11 @@ jobs:
 Вы можете настроить поведение бота, изменив следующие параметры в вашем workflow:
 
 ```yaml
-- uses: your-username/ai-review@v1
+- uses: malaev/ai-review@v1
   with:
     # Обязательные параметры
-    github-token: ${{ secrets.GITHUB_TOKEN }}
     deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+    github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
 ## Для разработчиков
@@ -74,8 +81,8 @@ npm run build
 # Запуск линтера
 npm run lint
 
-# Запуск тестов
-npm run test
+# Локальное тестирование
+npm run test:local
 ```
 
 ## Требования
