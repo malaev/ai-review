@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Build
+        run: npm run build
+        
+      - name: Package
+        run: |
+          cp action.yml package.json README.md dist/
+          cd dist
+          npm ci --production
+          
+      - name: Push to release branch
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          git checkout -b release
+          git add -f dist/
+          git commit -m "Release ${{ github.ref }}"
+          git push origin release --force 

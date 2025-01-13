@@ -1,0 +1,43 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - '**.ts'
+      - '**.tsx'
+      - '**.js'
+      - '**.jsx'
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Build project
+        run: npm run build
+        
+      - name: Run code review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NUMBER: ${{ github.event.pull_request.number }}
+        run: npm run review 

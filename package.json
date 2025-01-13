@@ -1,0 +1,28 @@
+{
+  "name": "ai-review",
+  "version": "1.0.0",
+  "description": "AI-powered code review agent for React + TypeScript projects",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "lint": "eslint src/**/*.ts",
+    "review": "node dist/index.js",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@octokit/rest": "^19.0.0",
+    "openai": "^4.0.0",
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.0.0",
+    "jest": "^29.0.0",
+    "@types/jest": "^29.0.0",
+    "ts-jest": "^29.0.0"
+  }
+}
