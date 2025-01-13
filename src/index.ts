@@ -632,8 +632,8 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
     comment_id,
   }));
 
-  if (!comment?.body || !comment.pull_request_url) {
-    console.error('Comment body or PR URL is empty');
+  if (!comment?.body || !comment.pull_request_url || !comment.line || !comment.path) {
+    console.error('Required comment data is missing');
     return;
   }
 
@@ -671,6 +671,26 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
     return;
   }
 
+  // Получаем содержимое файла
+  const { data: fileContent } = await withRetry(() => octokit.repos.getContent({
+    owner,
+    repo,
+    path: comment.path,
+    ref: `pull/${prNumber}/head`,
+  }));
+
+  if (!('content' in fileContent)) {
+    throw new Error('File content not found');
+  }
+
+  const content = Buffer.from(fileContent.content, 'base64').toString();
+  const lines = content.split('\n');
+
+  // Получаем контекст кода (10 строк до и после)
+  const startLine = Math.max(0, comment.line - 25);
+  const endLine = Math.min(lines.length, comment.line + 25);
+  const codeContext = lines.slice(startLine, endLine).join('\n');
+
   // Извлекаем тип проблемы из родительского комментария
   const typeMatch = parentComment.body.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i);
   const type = typeMatch ? typeMatch[2].toLowerCase() : 'quality';
@@ -693,6 +713,11 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
           content: `Вы эксперт по проверке кода для React + TypeScript проектов.
             Вы оставили комментарий о проблеме типа "${type}" в коде.
             
+            Проблемный код (строка ${comment.line}):
+            \`\`\`typescript
+            ${codeContext}
+            \`\`\`
+            
             Оригинальный комментарий:
             ${parentComment.body}
             
@@ -701,7 +726,7 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
             
             Ответьте на вопрос пользователя в контексте конкретной проблемы в коде.
             Используйте технический, но понятный язык.
-            Если нужно, предложите конкретное решение проблемы.`,
+            Если нужно, предложите конкретное решение проблемы, используя примеры кода.`,
         },
         {
           role: 'user',
