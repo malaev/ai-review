@@ -69,6 +69,12 @@ interface ConversationContext {
   }>;
 }
 
+interface ReviewComment {
+  path: string;
+  line: number;
+  body: string;
+}
+
 // Хранилище контекстов обсуждений
 const conversationContexts = new Map<string, ConversationContext>();
 
@@ -250,14 +256,104 @@ async function analyzeCodeWithDeepSeek(chunk: string, context?: ConversationCont
   return data.choices[0].message.content;
 }
 
-async function commentOnPR(prInfo: PullRequestInfo, analysis: CodeAnalysis) {
-  const comment = formatAnalysisComment(analysis);
-  await withRetry(() => octokit.issues.createComment({
+async function analyzeFile(file: { filename: string, patch?: string }, prInfo: PullRequestInfo): Promise<ReviewComment[]> {
+  // Получаем содержимое файла
+  const { data: fileContent } = await withRetry(() => octokit.repos.getContent({
     owner: prInfo.owner,
     repo: prInfo.repo,
-    issue_number: prInfo.pull_number,
-    body: comment,
+    path: file.filename,
+    ref: `pull/${prInfo.pull_number}/head`,
   }));
+
+  if (!('content' in fileContent)) {
+    throw new Error('File content not found');
+  }
+
+  const content = Buffer.from(fileContent.content, 'base64').toString();
+
+  const systemPrompt = `Вы эксперт по проверке кода для React + TypeScript проектов. 
+    Проанализируйте следующий код и найдите проблемы в конкретных строках.
+    Для каждой найденной проблемы укажите:
+    1. Номер строки (line)
+    2. Тип проблемы (type: 'quality' | 'security' | 'performance')
+    3. Описание проблемы (description)
+    
+    Формат ответа должен быть в виде JSON:
+    {
+      "issues": [
+        {
+          "line": number,
+          "type": "quality" | "security" | "performance",
+          "description": "string"
+        }
+      ]
+    }
+    
+    Учитывайте весь контекст файла при анализе.`;
+
+  const response = await withRetry(() => fetch(DEEPSEEK_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: 'deepseek-chat',
+      messages: [
+        {
+          role: 'system',
+          content: systemPrompt,
+        },
+        {
+          role: 'user',
+          content: content,
+        },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.3,
+      max_tokens: 2000,
+    }),
+  }));
+
+  if (!response.ok) {
+    throw new Error(`DeepSeek API error: ${response.statusText}`);
+  }
+
+  const data = await response.json() as { choices: [{ message: { content: string } }] };
+  const analysis = JSON.parse(data.choices[0].message.content);
+
+  return analysis.issues.map((issue: { line: number, type: string, description: string }) => ({
+    path: file.filename,
+    line: issue.line,
+    body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}`
+  }));
+}
+
+async function commentOnPR(prInfo: PullRequestInfo) {
+  // Получаем файлы, измененные в PR
+  const { data: files } = await withRetry(() => octokit.pulls.listFiles({
+    owner: prInfo.owner,
+    repo: prInfo.repo,
+    pull_number: prInfo.pull_number,
+  }));
+
+  // Анализируем каждый файл и собираем комментарии
+  const allComments = await Promise.all(
+    files
+      .filter(file => file.filename.match(/\.(ts|tsx|js|jsx)$/))
+      .map(file => analyzeFile(file, prInfo))
+  );
+
+  // Создаем ревью со всеми комментариями
+  const { data: review } = await withRetry(() => octokit.pulls.createReview({
+    owner: prInfo.owner,
+    repo: prInfo.repo,
+    pull_number: prInfo.pull_number,
+    event: 'COMMENT',
+    comments: allComments.flat(),
+  }));
+
+  console.log(`Created review: ${review.html_url}`);
 }
 
 function formatAnalysisComment(analysis: CodeAnalysis): string {
@@ -288,24 +384,8 @@ ${analysis.performance.map(item => `- ${item}`).join('\n')}` : ''}
 async function handlePRReview(prInfo: PullRequestInfo) {
   console.log(`Анализирую PR #${prInfo.pull_number}...`);
 
-  const diff = await getDiff(prInfo);
-  const chunks = chunkDiff(diff);
-
-  console.log(`Разбил diff на ${chunks.length} частей`);
-
-  const analyses = await Promise.all(chunks.map(chunk => analyzeCodeWithDeepSeek(chunk)));
-
-  const analysis = analyses.reduce((acc, curr) => {
-    const parsed = JSON.parse(curr) as CodeAnalysis;
-    return {
-      quality: [...acc.quality, ...parsed.quality],
-      security: [...acc.security, ...parsed.security],
-      performance: [...acc.performance, ...parsed.performance],
-    };
-  }, { quality: [], security: [], performance: [] } as CodeAnalysis);
-
-  console.log('Отправляю комментарий...');
-  await commentOnPR(prInfo, analysis);
+  console.log('Анализирую файлы и оставляю комментарии...');
+  await commentOnPR(prInfo);
   console.log('Готово!');
 }
 
