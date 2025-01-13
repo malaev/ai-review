@@ -331,7 +331,7 @@ async function analyzeFile(file, prInfo) {
       3. Тип проблемы (type)
       4. Описание проблемы (description)
       
-      Формат ответа:
+      Ответ должен быть в формате JSON со следующей структурой:
       {
         "issues": [
           {
