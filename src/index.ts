@@ -622,41 +622,64 @@ async function handlePRReview(prInfo: PullRequestInfo) {
   console.log('Готово!');
 }
 
-async function handleCommentReply(owner: string, repo: string, comment_id: number, reply_to_id: number) {
-  console.log(`Обрабатываю ответ на комментарий ${reply_to_id}...`);
+async function handleCommentReply(owner: string, repo: string, comment_id: number) {
+  console.log(`Обрабатываю комментарий ${comment_id}...`);
 
-  // Получаем оригинальный комментарий, на который отвечаем
-  const { data: originalComment } = await withRetry(() => octokit.issues.getComment({
-    owner,
-    repo,
-    comment_id: reply_to_id,
-  }));
-
-  // Получаем новый комментарий с вопросом
-  const { data: newComment } = await withRetry(() => octokit.issues.getComment({
+  // Получаем комментарий с вопросом
+  const { data: comment } = await withRetry(() => octokit.issues.getComment({
     owner,
     repo,
     comment_id,
   }));
 
-  if (!originalComment?.body || !newComment?.body) {
+  if (!comment?.body) {
     console.error('Comment body is empty');
     return;
   }
 
-  // Извлекаем контекст из оригинального комментария (тип проблемы и описание)
-  const typeMatch = originalComment.body.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i);
+  // Проверяем, что комментарий содержит обращение к боту
+  if (!comment.body.match(/^(@ai|\/ai)\s/i)) {
+    console.log('Comment does not start with @ai or /ai, ignoring');
+    return;
+  }
+
+  // Получаем контекст из родительского комментария
+  const threadResponse = await withRetry(() => octokit.issues.listComments({
+    owner,
+    repo,
+    issue_number: Number(comment.issue_url.split('/').pop()),
+    per_page: 100,
+  }));
+
+  // Ищем родительский комментарий от бота
+  const parentComment = threadResponse.data
+    .reverse()
+    .find(c =>
+      c.id < comment.id &&
+      c.body?.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i)
+    );
+
+  if (!parentComment?.body) {
+    console.error('Could not find parent bot comment');
+    return;
+  }
+
+  // Извлекаем контекст из родительского комментария
+  const typeMatch = parentComment.body.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i);
   const type = typeMatch ? typeMatch[2].toLowerCase() : 'quality';
+
+  // Убираем @ai или /ai из вопроса
+  const question = comment.body.replace(/^(@ai|\/ai)\s+/i, '');
 
   // Формируем промпт с контекстом
   const systemPrompt = `Вы эксперт по проверке кода для React + TypeScript проектов.
     Вы оставили комментарий о проблеме типа "${type}" в коде.
     
     Оригинальный комментарий:
-    ${originalComment.body}
+    ${parentComment.body}
     
     Пользователь задал вопрос:
-    ${newComment.body}
+    ${question}
     
     Ответьте на вопрос пользователя в контексте конкретной проблемы в коде.
     Используйте технический, но понятный язык.
@@ -678,7 +701,7 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
         },
         {
           role: 'user',
-          content: newComment.body,
+          content: question,
         },
       ],
       temperature: 0.3,
@@ -693,17 +716,12 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
   const data = await response.json() as DeepSeekResponse;
   const answer = data.choices[0].message.content;
 
-  const issueNumber = newComment.issue_url.split('/').pop();
-  if (!issueNumber) {
-    throw new Error('Could not extract issue number from URL');
-  }
-
   console.log('Отправляю ответ...');
   await withRetry(() => octokit.issues.createComment({
     owner,
     repo,
-    issue_number: parseInt(issueNumber, 10),
-    body: answer,
+    issue_number: Number(comment.issue_url.split('/').pop()),
+    body: `> ${question}\n\n${answer}\n\n*Чтобы задать еще вопрос, начните комментарий с @ai или /ai*`,
   }));
 
   console.log('Готово!');
@@ -726,24 +744,10 @@ async function main() {
       await handlePRReview({ owner, repo, pull_number });
     } else if (eventName === 'issue_comment') {
       const comment_id = Number(process.env.COMMENT_ID);
-      const reply_to_id = Number(process.env.REPLY_TO_ID);
-
-      // Проверяем, что это ответ на комментарий бота
-      const { data: originalComment } = await withRetry(() => octokit.issues.getComment({
-        owner,
-        repo,
-        comment_id: reply_to_id || comment_id,
-      }));
-
-      if (originalComment?.body?.includes('AI Code Review') ||
-        originalComment?.body?.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i)) {
-        if (!comment_id) {
-          throw new Error('Missing comment ID');
-        }
-        await handleCommentReply(owner, repo, comment_id, reply_to_id || comment_id);
-      } else {
-        console.log('Not a reply to bot comment, ignoring');
+      if (!comment_id) {
+        throw new Error('Missing comment ID');
       }
+      await handleCommentReply(owner, repo, comment_id);
     } else {
       throw new Error(`Unsupported event type: ${eventName}`);
     }

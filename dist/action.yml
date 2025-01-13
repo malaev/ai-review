@@ -15,16 +15,24 @@ inputs:
     default: ${{ github.token }}
   PR_NUMBER:
     description: 'Pull request number'
-    required: true
+    required: false
     default: ${{ github.event.pull_request.number }}
   GITHUB_REPOSITORY:
     description: 'Repository name with owner'
-    required: true
+    required: false
     default: ${{ github.repository }}
   GITHUB_EVENT_NAME:
     description: 'Name of the event that triggered the workflow'
-    required: true
+    required: false
     default: ${{ github.event_name }}
+  COMMENT_ID:
+    description: 'Comment ID for reply handling'
+    required: false
+    default: ${{ github.event.comment.id }}
+  REPLY_TO_ID:
+    description: 'Parent comment ID for reply handling'
+    required: false
+    default: ${{ github.event.comment.in_reply_to_id }}
 
 runs:
   using: 'node20'
