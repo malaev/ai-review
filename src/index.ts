@@ -271,6 +271,72 @@ async function analyzeCodeWithDeepSeek(chunk: string, context?: ConversationCont
   return data.choices[0].message.content;
 }
 
+// Функция для вычисления расстояния Левенштейна между строками
+function levenshteinDistance(a: string, b: string): number {
+  const matrix = Array(b.length + 1).fill(null).map(() => Array(a.length + 1).fill(null));
+
+  for (let i = 0; i <= a.length; i++) matrix[0][i] = i;
+  for (let j = 0; j <= b.length; j++) matrix[j][0] = j;
+
+  for (let j = 1; j <= b.length; j++) {
+    for (let i = 1; i <= a.length; i++) {
+      const substitutionCost = a[i - 1] === b[j - 1] ? 0 : 1;
+      matrix[j][i] = Math.min(
+        matrix[j][i - 1] + 1, // deletion
+        matrix[j - 1][i] + 1, // insertion
+        matrix[j - 1][i - 1] + substitutionCost // substitution
+      );
+    }
+  }
+
+  return matrix[b.length][a.length];
+}
+
+// Функция для нормализации строки кода (убирает пробелы, табуляцию и т.д.)
+function normalizeCode(code: string): string {
+  return code.trim().replace(/\s+/g, ' ');
+}
+
+// Функция для поиска наиболее похожей строки
+function findMostSimilarLine(targetLine: string, fileLines: string[], startLine: number, endLine: number): number {
+  let bestMatch = {
+    lineNumber: startLine,
+    similarity: Infinity,
+  };
+
+  const normalizedTarget = normalizeCode(targetLine);
+
+  // Ищем в диапазоне ±10 строк от предполагаемой позиции
+  const searchStart = Math.max(0, startLine - 10);
+  const searchEnd = Math.min(fileLines.length, endLine + 10);
+
+  for (let i = searchStart; i < searchEnd; i++) {
+    const normalizedLine = normalizeCode(fileLines[i]);
+    const distance = levenshteinDistance(normalizedTarget, normalizedLine);
+
+    // Нормализуем расстояние относительно длины строк
+    const similarity = distance / Math.max(normalizedTarget.length, normalizedLine.length);
+
+    if (similarity < bestMatch.similarity) {
+      bestMatch = {
+        lineNumber: i + 1, // +1 потому что нумерация строк с 1
+        similarity: similarity,
+      };
+    }
+  }
+
+  // Если сходство слишком низкое, возвращаем изначальную строку
+  return bestMatch.similarity < 0.5 ? bestMatch.lineNumber : startLine;
+}
+
+interface AnalysisIssueWithCode extends AnalysisIssue {
+  code: string;  // Добавляем поле для хранения проблемной строки
+}
+
+interface AnalysisResponseWithCode {
+  issues: AnalysisIssueWithCode[];
+}
+
 async function analyzeFile(file: { filename: string, patch?: string }, prInfo: PullRequestInfo): Promise<ReviewComment[]> {
   // Получаем содержимое файла
   const { data: fileContent } = await withRetry(() => octokit.repos.getContent({
@@ -330,14 +396,18 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
     - Серьезных проблемах производительности
     - Логических ошибках в бизнес-логике
     
-    ВАЖНО: Для каждой проблемы обязательно укажите точный номер строки, где находится проблемный код.
-    Не указывайте номера строк приблизительно или "где-то рядом".
+    ВАЖНО: Для каждой проблемы обязательно укажите:
+    1. Точный номер строки (line)
+    2. Саму проблемную строку кода (code)
+    3. Тип проблемы (type)
+    4. Описание проблемы (description)
     
     Формат ответа:
     {
       "issues": [
         {
-          "line": number,  // Точный номер строки с проблемой
+          "line": number,
+          "code": "string", // Точная строка кода с проблемой
           "type": "quality" | "security" | "performance",
           "description": "string"
         }
@@ -376,7 +446,7 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
   let analysis;
 
   try {
-    analysis = JSON.parse(data.choices[0].message.content) as AnalysisResponse;
+    analysis = JSON.parse(data.choices[0].message.content) as AnalysisResponseWithCode;
   } catch (error) {
     console.error('Failed to parse DeepSeek response:', error);
     console.log('Raw response:', data.choices[0].message.content);
@@ -388,17 +458,31 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
     return [];
   }
 
+  // Разбиваем файл на строки для поиска
+  const fileLines = content.split('\n');
+
   return analysis.issues
-    .filter((issue): issue is AnalysisIssue =>
+    .filter((issue): issue is AnalysisIssueWithCode =>
       typeof issue.line === 'number' &&
+      typeof issue.code === 'string' &&
       typeof issue.type === 'string' &&
       typeof issue.description === 'string'
     )
-    .map(issue => ({
-      path: file.filename,
-      line: issue.line,
-      body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, ответьте на этот комментарий.*`
-    }));
+    .map(issue => {
+      // Ищем наиболее похожую строку
+      const actualLine = findMostSimilarLine(
+        issue.code,
+        fileLines,
+        Math.max(0, issue.line - 30),  // Начинаем поиск за 10 строк до
+        Math.min(fileLines.length, issue.line + 30)  // Заканчиваем через 10 строк после
+      );
+
+      return {
+        path: file.filename,
+        line: actualLine,
+        body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, ответьте на этот комментарий.*`
+      };
+    });
 }
 
 interface GitHubError extends Error {
