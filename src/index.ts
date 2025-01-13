@@ -5,19 +5,33 @@ import fetch from 'node-fetch';
 // Загружаем переменные окружения
 dotenv.config();
 
-if (!process.env.GITHUB_TOKEN) {
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+const PR_NUMBER = process.env.PR_NUMBER;
+const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY;
+
+if (!GITHUB_TOKEN) {
   throw new Error('GITHUB_TOKEN is required');
 }
 
-if (!process.env.DEEPSEEK_API_KEY) {
+if (!DEEPSEEK_API_KEY) {
   throw new Error('DEEPSEEK_API_KEY is required');
 }
 
+if (!PR_NUMBER) {
+  throw new Error('PR_NUMBER is required');
+}
+
+if (!GITHUB_REPOSITORY) {
+  throw new Error('GITHUB_REPOSITORY is required');
+}
+
+const [owner, repo] = GITHUB_REPOSITORY.split('/');
+
 const octokit = new Octokit({
-  auth: process.env.GITHUB_TOKEN,
+  auth: GITHUB_TOKEN,
 });
 
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
 
 // Максимальное количество попыток для API запросов
@@ -345,7 +359,7 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
 }
 
 async function main() {
-  const [owner, repo] = process.env.GITHUB_REPOSITORY?.split('/') || [];
+  const [owner, repo] = GITHUB_REPOSITORY?.split('/') || [];
   const eventName = process.env.GITHUB_EVENT_NAME;
 
   if (!owner || !repo) {
@@ -354,9 +368,9 @@ async function main() {
 
   try {
     if (eventName === 'pull_request') {
-      const pull_number = Number(process.env.PR_NUMBER);
-      if (!pull_number) {
-        throw new Error('Missing PR number');
+      const pull_number = Number(PR_NUMBER);
+      if (isNaN(pull_number)) {
+        throw new Error(`Invalid PR number: ${PR_NUMBER}`);
       }
       await handlePRReview({ owner, repo, pull_number });
     } else if (eventName === 'issue_comment') {
