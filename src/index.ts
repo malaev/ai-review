@@ -7,8 +7,9 @@ dotenv.config();
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
-const PR_NUMBER = process.env.PR_NUMBER;
 const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY;
+const GITHUB_EVENT_NAME = process.env.GITHUB_EVENT_NAME;
+let PR_NUMBER: string | undefined;
 
 if (!GITHUB_TOKEN) {
   throw new Error('GITHUB_TOKEN is required');
@@ -18,15 +19,19 @@ if (!DEEPSEEK_API_KEY) {
   throw new Error('DEEPSEEK_API_KEY is required');
 }
 
-if (!PR_NUMBER) {
-  throw new Error('PR_NUMBER is required');
-}
-
 if (!GITHUB_REPOSITORY) {
   throw new Error('GITHUB_REPOSITORY is required');
 }
 
 const [owner, repo] = GITHUB_REPOSITORY.split('/');
+
+// PR_NUMBER требуется только для события pull_request
+if (GITHUB_EVENT_NAME === 'pull_request') {
+  PR_NUMBER = process.env.PR_NUMBER;
+  if (!PR_NUMBER) {
+    throw new Error('PR_NUMBER is required for pull_request events');
+  }
+}
 
 const octokit = new Octokit({
   auth: GITHUB_TOKEN,
@@ -392,37 +397,75 @@ async function handlePRReview(prInfo: PullRequestInfo) {
 async function handleCommentReply(owner: string, repo: string, comment_id: number, reply_to_id: number) {
   console.log(`Обрабатываю ответ на комментарий ${reply_to_id}...`);
 
-  const context = await getCommentContext(owner, repo, reply_to_id);
-  if (!context) {
-    console.error('Could not find context for comment');
-    return;
-  }
+  // Получаем оригинальный комментарий, на который отвечаем
+  const { data: originalComment } = await withRetry(() => octokit.issues.getComment({
+    owner,
+    repo,
+    comment_id: reply_to_id,
+  }));
 
-  const { data: comment } = await withRetry(() => octokit.issues.getComment({
+  // Получаем новый комментарий с вопросом
+  const { data: newComment } = await withRetry(() => octokit.issues.getComment({
     owner,
     repo,
     comment_id,
   }));
 
-  if (!comment?.body) {
+  if (!originalComment?.body || !newComment?.body) {
     console.error('Comment body is empty');
     return;
   }
 
-  context.messages.push({
-    role: 'user',
-    content: comment.body,
-  });
+  // Извлекаем контекст из оригинального комментария (тип проблемы и описание)
+  const typeMatch = originalComment.body.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i);
+  const type = typeMatch ? typeMatch[2].toLowerCase() : 'quality';
+
+  // Формируем промпт с контекстом
+  const systemPrompt = `Вы эксперт по проверке кода для React + TypeScript проектов.
+    Вы оставили комментарий о проблеме типа "${type}" в коде.
+    
+    Оригинальный комментарий:
+    ${originalComment.body}
+    
+    Пользователь задал вопрос:
+    ${newComment.body}
+    
+    Ответьте на вопрос пользователя в контексте конкретной проблемы в коде.
+    Используйте технический, но понятный язык.
+    Если нужно, предложите конкретное решение проблемы.`;
 
   console.log('Анализирую вопрос...');
-  const response = await analyzeCodeWithDeepSeek(comment.body, context);
+  const response = await withRetry(() => fetch(DEEPSEEK_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: 'deepseek-chat',
+      messages: [
+        {
+          role: 'system',
+          content: systemPrompt,
+        },
+        {
+          role: 'user',
+          content: newComment.body,
+        },
+      ],
+      temperature: 0.3,
+      max_tokens: 2000,
+    }),
+  }));
 
-  context.messages.push({
-    role: 'assistant',
-    content: response,
-  });
+  if (!response.ok) {
+    throw new Error(`DeepSeek API error: ${response.statusText}`);
+  }
 
-  const issueNumber = comment.issue_url.split('/').pop();
+  const data = await response.json() as DeepSeekResponse;
+  const answer = data.choices[0].message.content;
+
+  const issueNumber = newComment.issue_url.split('/').pop();
   if (!issueNumber) {
     throw new Error('Could not extract issue number from URL');
   }
@@ -432,7 +475,7 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
     owner,
     repo,
     issue_number: parseInt(issueNumber, 10),
-    body: response,
+    body: answer,
   }));
 
   console.log('Готово!');
