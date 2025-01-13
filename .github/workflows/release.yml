@@ -7,8 +7,12 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -26,13 +30,16 @@ jobs:
         run: |
           cp action.yml package.json README.md dist/
           cd dist
-          npm ci --production
+          npm install --omit=dev
           
       - name: Push to release branch
         run: |
-          git config --global user.name "GitHub Action"
-          git config --global user.email "action@github.com"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}
           git checkout -b release
           git add -f dist/
           git commit -m "Release ${{ github.ref }}"
-          git push origin release --force 
+          git push origin release --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
