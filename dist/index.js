@@ -284,64 +284,36 @@ async function analyzeFile(file, prInfo) {
             console.log(`File ${file.filename} is too large (${content.length} chars), analyzing first 30000 chars`);
             content = content.slice(0, 30000);
         }
-        const lines = content.split('\n');
-        // Создаем карту соответствия строк в файле и в diff
-        const lineMap = new Map();
+        // Парсим diff чтобы получить измененные строки
+        const changedLines = new Map();
         if (file.patch) {
             const diffLines = file.patch.split('\n');
-            let fileLineNum = 0;
-            let diffLineNum = 0;
+            let currentLine = 0;
+            let inHunk = false;
             for (const line of diffLines) {
                 if (line.startsWith('@@')) {
                     const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
                     if (match) {
-                        fileLineNum = parseInt(match[1], 10) - 1;
+                        currentLine = parseInt(match[1], 10) - 1;
+                        inHunk = true;
                     }
                     continue;
                 }
-                if (!line.startsWith('-')) {
-                    lineMap.set(fileLineNum + 1, diffLineNum + 1);
-                    fileLineNum++;
+                if (inHunk) {
+                    if (line.startsWith('+')) {
+                        changedLines.set(currentLine + 1, line.substring(1));
+                        currentLine++;
+                    }
+                    else if (line.startsWith('-')) {
+                        // Пропускаем удаленные строки
+                    }
+                    else {
+                        currentLine++;
+                    }
                 }
-                diffLineNum++;
             }
         }
-        const systemPrompt = `Вы опытный ревьюер React + TypeScript проектов.
-      Проанализируйте код и найдите только серьезные проблемы, которые могут привести к багам или проблемам с производительностью.
-      
-      НЕ НУЖНО комментировать:
-      - Стилистические проблемы
-      - Отсутствие типов там, где они очевидны из контекста
-      - Использование console.log
-      - Мелкие предупреждения линтера
-      - Отсутствие документации
-      - Форматирование кода
-      
-      Сфокусируйтесь на:
-      - Утечках памяти
-      - Неправильном использовании React хуков
-      - Потенциальных race conditions
-      - Проблемах безопасности
-      - Серьезных проблемах производительности
-      - Логических ошибках в бизнес-логике
-      
-      ВАЖНО: Для каждой проблемы обязательно укажите:
-      1. Точный номер строки (line)
-      2. Саму проблемную строку кода (code)
-      3. Тип проблемы (type)
-      4. Описание проблемы (description)
-      
-      Ответ должен быть в формате JSON со следующей структурой:
-      {
-        "issues": [
-          {
-            "line": number,
-            "code": "string", // Точная строка кода с проблемой
-            "type": "quality" | "security" | "performance",
-            "description": "string"
-          }
-        ]
-      }`;
+        // Анализируем код с помощью DeepSeek
         const response = await withRetry(() => (0, node_fetch_1.default)(DEEPSEEK_API_URL, {
             method: 'POST',
             headers: {
@@ -353,7 +325,42 @@ async function analyzeFile(file, prInfo) {
                 messages: [
                     {
                         role: 'system',
-                        content: systemPrompt,
+                        content: `Вы опытный ревьюер React + TypeScript проектов.
+              Проанализируйте код и найдите только серьезные проблемы, которые могут привести к багам или проблемам с производительностью.
+              
+              НЕ НУЖНО комментировать:
+              - Стилистические проблемы
+              - Отсутствие типов там, где они очевидны из контекста
+              - Использование console.log
+              - Мелкие предупреждения линтера
+              - Отсутствие документации
+              - Форматирование кода
+              
+              Сфокусируйтесь на:
+              - Утечках памяти
+              - Неправильном использовании React хуков
+              - Потенциальных race conditions
+              - Проблемах безопасности
+              - Серьезных проблемах производительности
+              - Логических ошибках в бизнес-логике
+              
+              ВАЖНО: Для каждой проблемы обязательно укажите:
+              1. Точный номер строки (line)
+              2. Саму проблемную строку кода (code)
+              3. Тип проблемы (type)
+              4. Описание проблемы (description)
+              
+              Ответ должен быть в формате JSON со следующей структурой:
+              {
+                "issues": [
+                  {
+                    "line": number,
+                    "code": "string", // Точная строка кода с проблемой
+                    "type": "quality" | "security" | "performance",
+                    "description": "string"
+                  }
+                ]
+              }`,
                     },
                     {
                         role: 'user',
@@ -366,14 +373,7 @@ async function analyzeFile(file, prInfo) {
             }),
         }));
         if (!response.ok) {
-            const errorText = await response.text();
-            console.error('DeepSeek API error details:', {
-                status: response.status,
-                statusText: response.statusText,
-                headers: Object.fromEntries(response.headers.entries()),
-                body: errorText,
-            });
-            throw new Error(`DeepSeek API error: ${response.status} ${response.statusText}\n${errorText}`);
+            throw new Error(`DeepSeek API error: ${response.statusText}`);
         }
         const data = await response.json();
         let analysis;
@@ -389,27 +389,36 @@ async function analyzeFile(file, prInfo) {
             console.error('Invalid analysis format:', analysis);
             return [];
         }
-        // Разбиваем файл на строки для поиска
-        const fileLines = content.split('\n');
         return analysis.issues
             .filter((issue) => typeof issue.line === 'number' &&
             typeof issue.code === 'string' &&
             typeof issue.type === 'string' &&
             typeof issue.description === 'string')
             .map(issue => {
-            const actualLine = findMostSimilarLine(issue.code, fileLines, Math.max(0, issue.line - 30), Math.min(fileLines.length, issue.line + 30));
+            // Ищем ближайшую измененную строку к проблемной
+            let nearestLine = issue.line;
+            let minDistance = Infinity;
+            for (const [lineNum] of changedLines) {
+                const distance = Math.abs(lineNum - issue.line);
+                if (distance < minDistance) {
+                    minDistance = distance;
+                    nearestLine = lineNum;
+                }
+            }
+            // Если расстояние слишком большое, пропускаем комментарий
+            if (minDistance > 5) {
+                return null;
+            }
             return {
                 path: file.filename,
-                line: actualLine,
+                line: nearestLine,
                 body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, нажмите на три точки (⋯), выберите "Quote reply" и начните текст с @ai или /ai*`
             };
-        });
+        })
+            .filter((comment) => comment !== null);
     }
     catch (error) {
         console.error(`Error analyzing file ${file.filename}:`, error);
-        if (error instanceof Error) {
-            console.error('Error stack:', error.stack);
-        }
         return [];
     }
 }
@@ -530,7 +539,7 @@ async function handleCommentReply(owner, repo, comment_id) {
             body: data.body || '',
             path: data.path,
             line: data.line || 0,
-            pull_request_url: `https://api.github.com/repos/${owner}/${repo}/pulls/${data.pull_request_review_id || 0}`,
+            pull_request_url: data.pull_request_url,
         };
         isReviewComment = true;
         console.log('Найден review comment');
@@ -567,100 +576,23 @@ async function handleCommentReply(owner, repo, comment_id) {
         console.log('Comment does not start with @ai or /ai, ignoring');
         return;
     }
-    // Получаем родительский комментарий
-    let parentComment;
-    if (isReviewComment) {
-        // Для review comments получаем все комментарии PR
-        const prNumber = Number(comment.pull_request_url?.split('/').pop() || '0');
-        const { data: reviewComments } = await withRetry(() => octokit.pulls.listReviewComments({
-            owner,
-            repo,
-            pull_number: prNumber,
-            per_page: 100,
-        }));
-        // Ищем родительский комментарий от бота
-        parentComment = reviewComments
-            .reverse()
-            .find(c => c.id < comment.id &&
-            c.body?.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i));
-    }
-    else {
-        // Для обычных комментариев получаем все комментарии issue
-        const issueNumber = Number(comment.issue_url.split('/').pop());
-        const { data: comments } = await withRetry(() => octokit.issues.listComments({
-            owner,
-            repo,
-            issue_number: issueNumber,
-            per_page: 100,
-        }));
-        // Ищем родительский комментарий от бота
-        parentComment = comments
-            .reverse()
-            .find(c => c.id < comment.id &&
-            c.body?.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i));
-    }
-    if (!parentComment?.body) {
-        console.error('Could not find parent bot comment');
-        return;
-    }
-    // Собираем историю обсуждения
-    let threadHistory = [];
+    // Получаем номер PR или issue
+    let number;
     const reviewComment = isReviewComment ? comment : null;
     const issueComment = !isReviewComment ? comment : null;
     if (reviewComment?.pull_request_url) {
-        const prNumber = Number(reviewComment.pull_request_url.split('/').pop() || '0');
-        const { data: reviewComments } = await withRetry(() => octokit.pulls.listReviewComments({
-            owner,
-            repo,
-            pull_number: prNumber,
-            per_page: 100,
-        }));
-        // Находим все комментарии в этом треде
-        threadHistory = reviewComments
-            .filter(c => c.id !== undefined && c.body !== undefined && c.body !== null)
-            .map(c => ({
-            id: c.id,
-            body: c.body,
-            isBot: c.body.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i) !== null ||
-                c.body.match(/\*Чтобы задать еще вопрос/i) !== null,
-        }));
+        number = Number(reviewComment.pull_request_url.split('/').pop());
     }
     else if (issueComment?.issue_url) {
-        const issueNumber = Number(issueComment.issue_url.split('/').pop() || '0');
-        const { data: comments } = await withRetry(() => octokit.issues.listComments({
-            owner,
-            repo,
-            issue_number: issueNumber,
-            per_page: 100,
-        }));
-        // Находим все комментарии в этом треде
-        threadHistory = comments
-            .filter(c => c.id !== undefined && c.body !== undefined && c.body !== null)
-            .map(c => ({
-            id: c.id,
-            body: c.body,
-            isBot: c.body.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i) !== null ||
-                c.body.match(/\*Чтобы задать еще вопрос/i) !== null,
-        }));
+        number = Number(issueComment.issue_url.split('/').pop());
     }
     else {
-        console.log('Не удалось определить тип комментария или получить необходимые URL');
+        console.error('Could not determine PR/issue number');
         return;
     }
-    // Сортируем по времени
-    threadHistory.sort((a, b) => a.id - b.id);
-    // Формируем контекст обсуждения для API
-    const conversationContext = threadHistory
-        .map(msg => ({
-        role: msg.isBot ? 'assistant' : 'user',
-        content: msg.body,
-    }));
-    // Извлекаем контекст из родительского комментария
-    const typeMatch = parentComment.body.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i);
-    const type = typeMatch ? typeMatch[2].toLowerCase() : 'quality';
     // Убираем @ai или /ai из вопроса
     const question = comment.body.replace(/^(@ai|\/ai)\s+/i, '');
-    console.log('Анализирую вопрос с учетом истории обсуждения...');
+    console.log('Анализирую вопрос...');
     const response = await withRetry(() => (0, node_fetch_1.default)(DEEPSEEK_API_URL, {
         method: 'POST',
         headers: {
@@ -672,17 +604,10 @@ async function handleCommentReply(owner, repo, comment_id) {
             messages: [
                 {
                     role: 'system',
-                    content: `Вы эксперт по проверке кода для React + TypeScript проектов.
-            Вы участвуете в обсуждении проблемы типа "${type}" в коде.
-            
-            История обсуждения:
-            ${threadHistory.map(msg => `${msg.isBot ? 'Бот' : 'Пользователь'}: ${msg.body}`).join('\n\n')}
-            
-            Ответьте на последний вопрос пользователя, учитывая весь контекст обсуждения.
-            Используйте технический, но понятный язык.
+                    content: `Вы эксперт по проверке кода для React + TypeScript проектов. 
+            Ответьте на вопрос пользователя, используя технический, но понятный язык.
             Если нужно, предложите конкретное решение проблемы.`,
                 },
-                ...conversationContext,
                 {
                     role: 'user',
                     content: question,
@@ -698,25 +623,31 @@ async function handleCommentReply(owner, repo, comment_id) {
     const data = await response.json();
     const answer = data.choices[0].message.content;
     console.log('Отправляю ответ...');
-    if (isReviewComment) {
-        // Отвечаем в thread review comment
-        const prNumber = Number(comment.pull_request_url?.split('/').pop() || '0');
-        await withRetry(() => octokit.pulls.createReplyForReviewComment({
+    if (isReviewComment && reviewComment) {
+        // Получаем информацию о PR для создания review comment
+        const { data: pr } = await withRetry(() => octokit.pulls.get({
             owner,
             repo,
-            pull_number: prNumber,
-            comment_id: parentComment.id,
+            pull_number: number,
+        }));
+        await withRetry(() => octokit.pulls.createReviewComment({
+            owner,
+            repo,
+            pull_number: number,
             body: `> ${question}\n\n${answer}\n\n*Чтобы задать еще вопрос, нажмите на три точки (⋯), выберите "Quote reply" и начните текст с @ai или /ai*`,
+            commit_id: pr.head.sha,
+            path: reviewComment.path,
+            line: reviewComment.line,
+            in_reply_to: comment.id,
         }));
     }
-    else {
-        // Отвечаем в thread обычного комментария
-        const issueNumber = Number(comment.issue_url.split('/').pop());
+    else if (issueComment) {
         await withRetry(() => octokit.issues.createComment({
             owner,
             repo,
-            issue_number: issueNumber,
+            issue_number: number,
             body: `> ${question}\n\n${answer}\n\n*Чтобы задать еще вопрос, нажмите на три точки (⋯), выберите "Quote reply" и начните текст с @ai или /ai*`,
+            in_reply_to: comment.id,
         }));
     }
     console.log('Готово!');
