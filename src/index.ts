@@ -285,6 +285,31 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
   }
 
   const content = Buffer.from(fileContent.content, 'base64').toString();
+  const lines = content.split('\n');
+
+  // Создаем карту соответствия строк в файле и в diff
+  const lineMap = new Map<number, number>();
+  if (file.patch) {
+    const diffLines = file.patch.split('\n');
+    let fileLineNum = 0;
+    let diffLineNum = 0;
+
+    for (const line of diffLines) {
+      if (line.startsWith('@@')) {
+        const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        if (match) {
+          fileLineNum = parseInt(match[1], 10) - 1;
+        }
+        continue;
+      }
+
+      if (!line.startsWith('-')) {
+        lineMap.set(fileLineNum + 1, diffLineNum + 1);
+        fileLineNum++;
+      }
+      diffLineNum++;
+    }
+  }
 
   const systemPrompt = `Вы опытный ревьюер React + TypeScript проектов.
     Проанализируйте код и найдите только серьезные проблемы, которые могут привести к багам или проблемам с производительностью.
@@ -305,16 +330,14 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
     - Серьезных проблемах производительности
     - Логических ошибках в бизнес-логике
     
-    Для каждой найденной проблемы укажите:
-    1. Номер строки (line)
-    2. Тип проблемы (type: 'quality' | 'security' | 'performance')
-    3. Описание проблемы (description)
+    ВАЖНО: Для каждой проблемы обязательно укажите точный номер строки, где находится проблемный код.
+    Не указывайте номера строк приблизительно или "где-то рядом".
     
-    ВАЖНО: Ответ должен быть строго в формате JSON без дополнительных пояснений:
+    Формат ответа:
     {
       "issues": [
         {
-          "line": number,
+          "line": number,  // Точный номер строки с проблемой
           "type": "quality" | "security" | "performance",
           "description": "string"
         }
@@ -357,7 +380,6 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
   } catch (error) {
     console.error('Failed to parse DeepSeek response:', error);
     console.log('Raw response:', data.choices[0].message.content);
-    // Возвращаем пустой массив комментариев в случае ошибки
     return [];
   }
 
@@ -375,7 +397,7 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
     .map(issue => ({
       path: file.filename,
       line: issue.line,
-      body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}`
+      body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, ответьте на этот комментарий.*`
     }));
 }
 
@@ -599,10 +621,23 @@ async function main() {
     } else if (eventName === 'issue_comment') {
       const comment_id = Number(process.env.COMMENT_ID);
       const reply_to_id = Number(process.env.REPLY_TO_ID);
-      if (!comment_id || !reply_to_id) {
-        throw new Error('Missing comment information');
+
+      // Проверяем, что это ответ на комментарий бота
+      const { data: originalComment } = await withRetry(() => octokit.issues.getComment({
+        owner,
+        repo,
+        comment_id: reply_to_id || comment_id,
+      }));
+
+      if (originalComment?.body?.includes('AI Code Review') ||
+        originalComment?.body?.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i)) {
+        if (!comment_id) {
+          throw new Error('Missing comment ID');
+        }
+        await handleCommentReply(owner, repo, comment_id, reply_to_id || comment_id);
+      } else {
+        console.log('Not a reply to bot comment, ignoring');
       }
-      await handleCommentReply(owner, repo, comment_id, reply_to_id);
     } else {
       throw new Error(`Unsupported event type: ${eventName}`);
     }
