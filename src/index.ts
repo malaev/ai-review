@@ -75,6 +75,20 @@ interface ConversationContext {
 }
 
 interface ReviewComment {
+  id: number;
+  body?: string;
+  path: string;
+  line: number;
+  pull_request_url?: string;
+}
+
+interface IssueComment {
+  id: number;
+  body?: string;
+  issue_url: string;
+}
+
+interface DraftReviewComment {
   path: string;
   line: number;
   body: string;
@@ -337,7 +351,7 @@ interface AnalysisResponseWithCode {
   issues: AnalysisIssueWithCode[];
 }
 
-async function analyzeFile(file: { filename: string, patch?: string }, prInfo: PullRequestInfo): Promise<ReviewComment[]> {
+async function analyzeFile(file: { filename: string, patch?: string }, prInfo: PullRequestInfo): Promise<DraftReviewComment[]> {
   try {
     // Получаем содержимое файла
     const { data: fileContent } = await withRetry(() => octokit.repos.getContent({
@@ -484,18 +498,17 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
         typeof issue.description === 'string'
       )
       .map(issue => {
-        // Ищем наиболее похожую строку
         const actualLine = findMostSimilarLine(
           issue.code,
           fileLines,
-          Math.max(0, issue.line - 30),  // Начинаем поиск за 10 строк до
-          Math.min(fileLines.length, issue.line + 30)  // Заканчиваем через 10 строк после
+          Math.max(0, issue.line - 30),
+          Math.min(fileLines.length, issue.line + 30)
         );
 
         return {
           path: file.filename,
           line: actualLine,
-          body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, ответьте на этот комментарий.*`
+          body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, нажмите на три точки (⋯), выберите "Quote reply" и начните текст с @ai или /ai*`
         };
       });
   } catch (error) {
@@ -568,7 +581,7 @@ async function commentOnPR(prInfo: PullRequestInfo) {
     return;
   }
 
-  // Создаем ревью только с комментариями к измененным строкам
+  // Создаем ревью с комментариями
   try {
     const { data: review } = await withRetry(() => octokit.pulls.createReview({
       owner: prInfo.owner,
@@ -622,15 +635,64 @@ async function handlePRReview(prInfo: PullRequestInfo) {
   console.log('Готово!');
 }
 
+// Добавляем интерфейс для сообщения в треде
+interface ThreadMessage {
+  id: number;
+  body: string;
+  isBot: boolean;
+}
+
 async function handleCommentReply(owner: string, repo: string, comment_id: number) {
   console.log(`Обрабатываю комментарий ${comment_id}...`);
 
-  // Получаем комментарий с вопросом
-  const { data: comment } = await withRetry(() => octokit.issues.getComment({
-    owner,
-    repo,
-    comment_id,
-  }));
+  let comment: ReviewComment | IssueComment;
+  let isReviewComment = false;
+
+  // Сначала пробуем получить review comment
+  try {
+    const { data } = await withRetry(() => octokit.pulls.getReviewComment({
+      owner,
+      repo,
+      comment_id,
+    }));
+
+    if (!data.path || data.id === undefined) {
+      throw new Error('Required review comment data is missing');
+    }
+
+    comment = {
+      id: data.id,
+      body: data.body || '',
+      path: data.path,
+      line: data.line || 0,
+      pull_request_url: `https://api.github.com/repos/${owner}/${repo}/pulls/${data.pull_request_review_id || 0}`,
+    };
+    isReviewComment = true;
+    console.log('Найден review comment');
+  } catch (error) {
+    // Если не нашли review comment, пробуем обычный комментарий
+    try {
+      const { data } = await withRetry(() => octokit.issues.getComment({
+        owner,
+        repo,
+        comment_id,
+      }));
+
+      if (!data.issue_url || data.id === undefined) {
+        throw new Error('Required issue comment data is missing');
+      }
+
+      comment = {
+        id: data.id,
+        body: data.body || '',
+        issue_url: data.issue_url,
+      };
+      console.log('Найден обычный комментарий');
+    } catch (error) {
+      console.error('Не удалось найти комментарий:', error);
+      return;
+    }
+  }
 
   if (!comment?.body) {
     console.error('Comment body is empty');
@@ -643,26 +705,105 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
     return;
   }
 
-  // Получаем контекст из родительского комментария
-  const threadResponse = await withRetry(() => octokit.issues.listComments({
-    owner,
-    repo,
-    issue_number: Number(comment.issue_url.split('/').pop()),
-    per_page: 100,
-  }));
+  // Получаем родительский комментарий
+  let parentComment;
+  if (isReviewComment) {
+    // Для review comments получаем все комментарии PR
+    const prNumber = Number((comment as ReviewComment).pull_request_url?.split('/').pop() || '0');
+    const { data: reviewComments } = await withRetry(() => octokit.pulls.listReviewComments({
+      owner,
+      repo,
+      pull_number: prNumber,
+      per_page: 100,
+    }));
 
-  // Ищем родительский комментарий от бота
-  const parentComment = threadResponse.data
-    .reverse()
-    .find(c =>
-      c.id < comment.id &&
-      c.body?.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i)
-    );
+    // Ищем родительский комментарий от бота
+    parentComment = reviewComments
+      .reverse()
+      .find(c =>
+        c.id < comment.id &&
+        c.body?.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i)
+      );
+  } else {
+    // Для обычных комментариев получаем все комментарии issue
+    const issueNumber = Number((comment as IssueComment).issue_url.split('/').pop());
+    const { data: comments } = await withRetry(() => octokit.issues.listComments({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      per_page: 100,
+    }));
+
+    // Ищем родительский комментарий от бота
+    parentComment = comments
+      .reverse()
+      .find(c =>
+        c.id < comment.id &&
+        c.body?.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i)
+      );
+  }
 
   if (!parentComment?.body) {
     console.error('Could not find parent bot comment');
     return;
   }
+
+  // Собираем историю обсуждения
+  let threadHistory: ThreadMessage[] = [];
+
+  const reviewComment = isReviewComment ? comment as ReviewComment : null;
+  const issueComment = !isReviewComment ? comment as IssueComment : null;
+
+  if (reviewComment?.pull_request_url) {
+    const prNumber = Number(reviewComment.pull_request_url.split('/').pop() || '0');
+    const { data: reviewComments } = await withRetry(() => octokit.pulls.listReviewComments({
+      owner,
+      repo,
+      pull_number: prNumber,
+      per_page: 100,
+    }));
+
+    // Находим все комментарии в этом треде
+    threadHistory = reviewComments
+      .filter(c => c.id !== undefined && c.body !== undefined && c.body !== null)
+      .map(c => ({
+        id: c.id as number,
+        body: c.body as string,
+        isBot: (c.body as string).match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i) !== null ||
+          (c.body as string).match(/\*Чтобы задать еще вопрос/i) !== null,
+      }));
+  } else if (issueComment?.issue_url) {
+    const issueNumber = Number(issueComment.issue_url.split('/').pop() || '0');
+    const { data: comments } = await withRetry(() => octokit.issues.listComments({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      per_page: 100,
+    }));
+
+    // Находим все комментарии в этом треде
+    threadHistory = comments
+      .filter(c => c.id !== undefined && c.body !== undefined && c.body !== null)
+      .map(c => ({
+        id: c.id as number,
+        body: c.body as string,
+        isBot: (c.body as string).match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i) !== null ||
+          (c.body as string).match(/\*Чтобы задать еще вопрос/i) !== null,
+      }));
+  } else {
+    console.log('Не удалось определить тип комментария или получить необходимые URL');
+    return;
+  }
+
+  // Сортируем по времени
+  threadHistory.sort((a, b) => a.id - b.id);
+
+  // Формируем контекст обсуждения для API
+  const conversationContext = threadHistory
+    .map(msg => ({
+      role: msg.isBot ? 'assistant' as const : 'user' as const,
+      content: msg.body,
+    }));
 
   // Извлекаем контекст из родительского комментария
   const typeMatch = parentComment.body.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i);
@@ -671,21 +812,7 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
   // Убираем @ai или /ai из вопроса
   const question = comment.body.replace(/^(@ai|\/ai)\s+/i, '');
 
-  // Формируем промпт с контекстом
-  const systemPrompt = `Вы эксперт по проверке кода для React + TypeScript проектов.
-    Вы оставили комментарий о проблеме типа "${type}" в коде.
-    
-    Оригинальный комментарий:
-    ${parentComment.body}
-    
-    Пользователь задал вопрос:
-    ${question}
-    
-    Ответьте на вопрос пользователя в контексте конкретной проблемы в коде.
-    Используйте технический, но понятный язык.
-    Если нужно, предложите конкретное решение проблемы.`;
-
-  console.log('Анализирую вопрос...');
+  console.log('Анализирую вопрос с учетом истории обсуждения...');
   const response = await withRetry(() => fetch(DEEPSEEK_API_URL, {
     method: 'POST',
     headers: {
@@ -697,8 +824,17 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
       messages: [
         {
           role: 'system',
-          content: systemPrompt,
+          content: `Вы эксперт по проверке кода для React + TypeScript проектов.
+            Вы участвуете в обсуждении проблемы типа "${type}" в коде.
+            
+            История обсуждения:
+            ${threadHistory.map(msg => `${msg.isBot ? 'Бот' : 'Пользователь'}: ${msg.body}`).join('\n\n')}
+            
+            Ответьте на последний вопрос пользователя, учитывая весь контекст обсуждения.
+            Используйте технический, но понятный язык.
+            Если нужно, предложите конкретное решение проблемы.`,
         },
+        ...conversationContext,
         {
           role: 'user',
           content: question,
@@ -717,12 +853,26 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
   const answer = data.choices[0].message.content;
 
   console.log('Отправляю ответ...');
-  await withRetry(() => octokit.issues.createComment({
-    owner,
-    repo,
-    issue_number: Number(comment.issue_url.split('/').pop()),
-    body: `> ${question}\n\n${answer}\n\n*Чтобы задать еще вопрос, начните комментарий с @ai или /ai*`,
-  }));
+  if (isReviewComment) {
+    // Отвечаем в thread review comment
+    const prNumber = Number((comment as ReviewComment).pull_request_url?.split('/').pop() || '0');
+    await withRetry(() => octokit.pulls.createReplyForReviewComment({
+      owner,
+      repo,
+      pull_number: prNumber,
+      comment_id: parentComment.id,
+      body: `> ${question}\n\n${answer}\n\n*Чтобы задать еще вопрос, нажмите на три точки (⋯), выберите "Quote reply" и начните текст с @ai или /ai*`,
+    }));
+  } else {
+    // Отвечаем в thread обычного комментария
+    const issueNumber = Number((comment as IssueComment).issue_url.split('/').pop());
+    await withRetry(() => octokit.issues.createComment({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      body: `> ${question}\n\n${answer}\n\n*Чтобы задать еще вопрос, нажмите на три точки (⋯), выберите "Quote reply" и начните текст с @ai или /ai*`,
+    }));
+  }
 
   console.log('Готово!');
 }
