@@ -8,9 +8,18 @@ on:
       - '**.tsx'
       - '**.js'
       - '**.jsx'
+  issue_comment:
+    types: [created]
 
 jobs:
   review:
+    # Пропускаем, если это комментарий не в PR или не ответ на комментарий бота
+    if: |
+      (github.event_name == 'pull_request') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       contains(github.event.comment.in_reply_to_id, '*'))
+    
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -39,5 +48,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_EVENT_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          # Для PR событий
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # Для комментариев
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPLY_TO_ID: ${{ github.event.comment.in_reply_to_id }}
         run: npm run review 
