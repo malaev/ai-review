@@ -63,9 +63,14 @@ class CodeReviewController {
         console.log(`Found ${files.length} changed files`);
         // Анализируем каждый файл
         const allComments = [];
+        // Добавляем логирование для отслеживания измененных строк
+        console.log('==== Detailed file analysis ====');
         for (const file of files) {
             console.log(`Analyzing file: ${file.path}`);
             try {
+                // Добавляем логирование информации о файле
+                console.log(`File details: ${file.path}`);
+                console.log(`Has patch: ${!!file.patch}`);
                 // Получаем результаты анализа
                 const fileComments = await (0, utils_1.analyzeCodeContent)(file.path, file.content, this.config.deepseekApiKey, this.config.deepseekApiUrl);
                 // Фильтруем комментарии, оставляя только те, которые относятся к измененным строкам
@@ -82,11 +87,23 @@ class CodeReviewController {
             }
             catch (error) {
                 console.error(`Error analyzing file ${file.path}:`, error);
+                if (error instanceof Error) {
+                    console.error('Error stack:', error.stack);
+                }
             }
         }
         // Создаем ревью с комментариями
         if (allComments.length > 0) {
             console.log(`Creating ${allComments.length} review comments`);
+            // Логируем сводную информацию о комментариях
+            const commentsByFile = {};
+            for (const comment of allComments) {
+                commentsByFile[comment.path] = (commentsByFile[comment.path] || 0) + 1;
+            }
+            console.log('Comment distribution by file:');
+            for (const [path, count] of Object.entries(commentsByFile)) {
+                console.log(`- ${path}: ${count} comments`);
+            }
             await this.platform.createReview(prId, allComments);
             console.log('Review created successfully');
         }

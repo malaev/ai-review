@@ -75,7 +75,11 @@ class GitHubAdapter {
             console.log('No comments to create');
             return;
         }
+        // Добавляем детальное логирование
+        console.log('==== Creating review with comments ====');
+        console.log(`Total comments: ${comments.length}`);
         try {
+            console.log('Calling GitHub API to create review...');
             const { data: review } = await (0, utils_1.withRetry)(() => this.octokit.pulls.createReview({
                 owner: this.owner,
                 repo: this.repo,
@@ -87,8 +91,40 @@ class GitHubAdapter {
         }
         catch (error) {
             const githubError = error;
+            console.error('Error creating review:', githubError.status ? `Status: ${githubError.status}` : '', githubError.message || '');
             if (githubError.status === 422) {
                 console.error('Failed to create review. Some comments might be outside of the diff.');
+                console.log('Error:', JSON.stringify(githubError));
+                // Попытаемся создать комментарии по одному, чтобы определить проблемные
+                console.log('Trying to create comments one by one to identify problematic ones...');
+                let successCount = 0;
+                let failCount = 0;
+                for (let i = 0; i < comments.length; i++) {
+                    const comment = comments[i];
+                    try {
+                        // Получаем информацию о PR для создания review comment
+                        const { data: pr } = await (0, utils_1.withRetry)(() => this.octokit.pulls.get({
+                            owner: this.owner,
+                            repo: this.repo,
+                            pull_number: prNumber,
+                        }));
+                        await (0, utils_1.withRetry)(() => this.octokit.pulls.createReviewComment({
+                            owner: this.owner,
+                            repo: this.repo,
+                            pull_number: prNumber,
+                            body: comment.body,
+                            commit_id: pr.head.sha,
+                            path: comment.path,
+                            line: comment.line,
+                        }));
+                        successCount++;
+                    }
+                    catch (commentError) {
+                        failCount++;
+                        console.error(`Failed to create comment ${i + 1} for ${comment.path}:${comment.line} -`, commentError.status || '', commentError.message || '');
+                    }
+                }
+                console.log(`Individual comment creation results: ${successCount} succeeded, ${failCount} failed`);
             }
             else {
                 throw error;
