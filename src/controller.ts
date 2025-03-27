@@ -50,9 +50,17 @@ export class CodeReviewController {
     // Анализируем каждый файл
     const allComments: ReviewComment[] = [];
 
+    // Добавляем логирование для отслеживания измененных строк
+    console.log('==== Detailed file analysis ====');
+
     for (const file of files) {
       console.log(`Analyzing file: ${file.path}`);
+
       try {
+        // Добавляем логирование информации о файле
+        console.log(`File details: ${file.path}`);
+        console.log(`Has patch: ${!!file.patch}`);
+
         // Получаем результаты анализа
         const fileComments = await analyzeCodeContent(
           file.path,
@@ -74,12 +82,27 @@ export class CodeReviewController {
         }
       } catch (error) {
         console.error(`Error analyzing file ${file.path}:`, error);
+        if (error instanceof Error) {
+          console.error('Error stack:', error.stack);
+        }
       }
     }
 
     // Создаем ревью с комментариями
     if (allComments.length > 0) {
       console.log(`Creating ${allComments.length} review comments`);
+
+      // Логируем сводную информацию о комментариях
+      const commentsByFile: { [key: string]: number } = {};
+      for (const comment of allComments) {
+        commentsByFile[comment.path] = (commentsByFile[comment.path] || 0) + 1;
+      }
+
+      console.log('Comment distribution by file:');
+      for (const [path, count] of Object.entries(commentsByFile)) {
+        console.log(`- ${path}: ${count} comments`);
+      }
+
       await this.platform.createReview(prId, allComments);
       console.log('Review created successfully');
     } else {
