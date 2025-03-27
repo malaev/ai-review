@@ -1,4 +1,5 @@
 import fetch from 'node-fetch';
+import type { Response as NodeFetchResponse } from 'node-fetch';
 
 // Максимальное количество попыток для API запросов
 export const MAX_RETRIES = 3;
@@ -9,6 +10,9 @@ export interface ReviewComment {
   path: string;
   line: number;
   body: string;
+  similarity?: number;
+  originalCode?: string;
+  matchedPatch?: string;
 }
 
 export interface AnalysisIssue {
@@ -148,7 +152,7 @@ export async function analyzeCodeContent(
       
       ВАЖНО: Для каждой проблемы обязательно укажите:
       1. Точный номер строки (line)
-      2. Саму проблемную строку кода (code)
+      2. Саму проблемную строку кода (code) - УКАЖИТЕ ТОЛЬКО ИЗМЕНЕННУЮ СТРОКУ КОДА, а не весь блок
       3. Тип проблемы (type)
       4. Описание проблемы (description)
       
@@ -164,29 +168,43 @@ export async function analyzeCodeContent(
         ]
       }`;
 
-    const response = await withRetry(() => fetch(deepseekApiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${deepseekApiKey}`,
+    // Добавляем обработку таймаутов и повторные попытки для DeepSeek API
+    const response = await withRetry(
+      async () => {
+        const fetchPromise = fetch(deepseekApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${deepseekApiKey}`,
+          },
+          body: JSON.stringify({
+            model: 'deepseek-chat',
+            messages: [
+              {
+                role: 'system',
+                content: systemPrompt,
+              },
+              {
+                role: 'user',
+                content: content,
+              },
+            ],
+            response_format: { type: 'json_object' },
+            temperature: 0.3,
+            max_tokens: 4000,
+          }),
+        });
+
+        // Добавляем таймаут в 30 секунд
+        const timeoutPromise = new Promise<Response>((_, reject) => {
+          setTimeout(() => reject(new Error('DeepSeek API request timed out after 30s')), 30000);
+        });
+
+        // Используем Promise.race для обработки таймаутов
+        return await Promise.race([fetchPromise, timeoutPromise]) as Response;
       },
-      body: JSON.stringify({
-        model: 'deepseek-chat',
-        messages: [
-          {
-            role: 'system',
-            content: systemPrompt,
-          },
-          {
-            role: 'user',
-            content: content,
-          },
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.3,
-        max_tokens: 4000,
-      }),
-    }));
+      5  // Увеличиваем количество попыток
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -218,35 +236,54 @@ export async function analyzeCodeContent(
     // Разбиваем файл на строки для поиска
     const fileLines = content.split('\n');
 
-    return analysis.issues
-      .filter((issue): issue is AnalysisIssueWithCode =>
-        typeof issue.line === 'number' &&
-        typeof issue.code === 'string' &&
-        typeof issue.type === 'string' &&
-        typeof issue.description === 'string'
-      )
-      .map(issue => {
-        // Ищем наиболее похожую строку
-        const match = findMostSimilarLine(
-          issue.code,
-          fileLines,
-          Math.max(0, issue.line - 30),
-          Math.min(fileLines.length, issue.line + 30)
-        );
+    const result = [];
 
-        // Если сходство слишком низкое (больше 0.3), пропускаем комментарий
-        if (match.similarity > 0.3) {
-          console.log(`Skipping comment for line ${issue.line} due to low similarity (${match.similarity})`);
-          return null;
-        }
+    for (const issue of analysis.issues) {
+      // Проверяем, что у нас есть все необходимые поля
+      if (!issue.line || typeof issue.line !== 'number' ||
+        !issue.code || typeof issue.code !== 'string' ||
+        !issue.type || typeof issue.type !== 'string' ||
+        !issue.description || typeof issue.description !== 'string') {
+        console.log(`Skipping issue with invalid format:`, issue);
+        continue;
+      }
 
-        return {
-          path: filePath,
-          line: match.lineNumber,
-          body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, начните текст с @ai или /ai*`
-        };
-      })
-      .filter((comment): comment is ReviewComment => comment !== null);
+      // Нормализуем строку кода из анализа
+      const normalizedIssueCode = normalizeCode(issue.code);
+
+      // Ищем наиболее похожую строку в более широком диапазоне
+      const searchRangeStart = Math.max(0, issue.line - 50);
+      const searchRangeEnd = Math.min(fileLines.length, issue.line + 50);
+
+      // Ищем наиболее похожую строку в этом диапазоне
+      const match = findMostSimilarLine(
+        issue.code,
+        fileLines,
+        searchRangeStart,
+        searchRangeEnd
+      );
+
+      // Увеличиваем порог схожести до 0.5 (было 0.3)
+      // Это означает, что мы принимаем строки, которые похожи на 50% и более
+      if (match.similarity > 0.5) {
+        console.log(`Skipping comment for line ${issue.line} due to low similarity (${match.similarity})`);
+        continue;
+      }
+
+      // Проверяем, что строка не выходит за пределы файла
+      if (match.lineNumber <= 0 || match.lineNumber > fileLines.length) {
+        console.log(`Skipping comment for line ${match.lineNumber}: invalid line number`);
+        continue;
+      }
+
+      result.push({
+        path: filePath,
+        line: match.lineNumber,
+        body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, начните текст с @ai или /ai*`
+      });
+    }
+
+    return result;
   } catch (error) {
     console.error(`Error analyzing file ${filePath}:`, error);
     if (error instanceof Error) {
@@ -351,4 +388,391 @@ export function parseDiffToChangedLines(patch: string): Set<number> {
   }
 
   return changedLines;
+}
+
+// Определим тип для API-комментария
+interface AIComment {
+  code: string;
+  comment: string;
+}
+
+// Функция для вычисления похожести двух строк
+export function calculateSimilarity(str1: string, str2: string): number {
+  if (!str1 || !str2) return 0;
+  if (str1 === str2) return 1.0;
+
+  // Простое сравнение: длина общего префикса / максимальная длина строк
+  let i = 0;
+  const minLen = Math.min(str1.length, str2.length);
+
+  while (i < minLen && str1[i] === str2[i]) {
+    i++;
+  }
+
+  // Базовая оценка по префиксу
+  let score = i / Math.max(str1.length, str2.length);
+
+  // Если строки имеют общий префикс, улучшим оценку, проверив суффикс
+  if (score > 0.3) {
+    let j = 0;
+    while (j < minLen &&
+      str1[str1.length - 1 - j] === str2[str2.length - 1 - j] &&
+      (str1.length - 1 - j) > i &&
+      (str2.length - 1 - j) > i) {
+      j++;
+    }
+
+    // Учитываем и префикс, и суффикс
+    score = (i + j) / Math.max(str1.length, str2.length);
+  }
+
+  return score;
+}
+
+// Функция для генерации комментариев для изменений
+export async function generateCommentsForChanges(
+  filePath: string,
+  codeChanges: string,
+  fileContent: string | null,
+  repo: string
+): Promise<AIComment[]> {
+  console.log(`Generating comments for ${filePath} in repo ${repo}`);
+
+  // Проверим, что у нас есть что анализировать
+  if (!codeChanges || codeChanges.trim().length === 0) {
+    console.log(`No code changes to analyze for ${filePath}`);
+    return [];
+  }
+
+  // Используем DeepSeek API для анализа
+  const messages = [
+    {
+      role: "system", content:
+        `You are a code review assistant. Your task is to review code changes and provide helpful comments.
+      Focus on code quality, potential bugs, security issues, and best practices.
+      For each issue, quote the specific code it applies to, and provide a clear explanation.
+      Be concise and specific. Don't comment on trivial issues.`
+    },
+    {
+      role: "user", content:
+        `Review the following code changes in file ${filePath} from repository ${repo}.
+      
+      Here's the code:
+      \`\`\`
+      ${codeChanges}
+      \`\`\`
+      
+      ${fileContent ? `For context, here's the full file content:
+      \`\`\`
+      ${fileContent}
+      \`\`\`
+      ` : ''}
+      
+      Respond in the following format for each issue found:
+      - Code: <paste the exact code the comment applies to>
+      - Comment: <your review comment>
+      
+      If there are no issues worth commenting on, just respond with "No issues found."`
+    }
+  ];
+
+  try {
+    const payload = {
+      model: "deepseek-chat",
+      messages: messages,
+      temperature: 0.3,
+      max_tokens: 1024
+    };
+
+    // Вызов DeepSeek API
+    const response = await fetchFromDeepSeekAPI(payload);
+    const data = await response.json();
+
+    // Обработка ответа
+    if (!data.choices || !data.choices[0] || !data.choices[0].message) {
+      console.warn(`Unexpected response format from DeepSeek API for ${filePath}`);
+      return [];
+    }
+
+    const content = data.choices[0].message.content;
+    console.log(`DeepSeek API response for ${filePath}: ${content.length} chars`);
+
+    // Разбор результатов
+    const comments: AIComment[] = [];
+
+    if (content.includes("No issues found")) {
+      console.log(`No issues found for ${filePath}`);
+      return [];
+    }
+
+    // Парсим комментарии из формата ответа AI
+    const regex = /- Code:\s+```(?:\w+)?\s+([\s\S]+?)```\s+- Comment:\s+([\s\S]+?)(?=- Code:|$)/g;
+    let match;
+
+    while ((match = regex.exec(content)) !== null) {
+      const code = match[1].trim();
+      const comment = match[2].trim();
+
+      if (code && comment) {
+        comments.push({ code, comment });
+      }
+    }
+
+    // Если не нашли по основному регулярному выражению, попробуем альтернативные форматы
+    if (comments.length === 0) {
+      // Альтернативный формат: без кода в блоках
+      const simpleRegex = /- Code:\s+([\s\S]+?)\s+- Comment:\s+([\s\S]+?)(?=- Code:|$)/g;
+      while ((match = simpleRegex.exec(content)) !== null) {
+        const code = match[1].trim();
+        const comment = match[2].trim();
+
+        if (code && comment) {
+          comments.push({ code, comment });
+        }
+      }
+    }
+
+    console.log(`Parsed ${comments.length} comments from DeepSeek response for ${filePath}`);
+    return comments;
+
+  } catch (error) {
+    console.error(`Error generating comments for ${filePath}:`, error);
+    return [];
+  }
+}
+
+export async function fetchFromDeepSeekAPI(
+  payload: Record<string, any>,
+  endpoint: string = 'https://api.deepseek.com/v1/chat/completions',
+  retries: number = 3,
+  initialDelay: number = 1000
+): Promise<NodeFetchResponse> {
+  console.log(`Calling DeepSeek API: ${endpoint}`);
+  console.log(`Payload parameters: model=${payload.model}, temperature=${payload.temperature}`);
+
+  let attempt = 0;
+  let delay = initialDelay;
+
+  while (attempt < retries) {
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        },
+        body: JSON.stringify(payload),
+      }) as NodeFetchResponse;
+
+      if (response.ok) {
+        console.log(`DeepSeek API call successful (${response.status})`);
+        return response;
+      } else {
+        const errorText = await response.text();
+        console.error(`DeepSeek API error (${response.status}): ${errorText}`);
+
+        // Проверяем тип ошибки
+        if (response.status === 429 || response.status >= 500) {
+          // Только для ошибок, связанных с ограничением запросов или с сервером
+          attempt++;
+          console.log(`Retrying DeepSeek API call (attempt ${attempt}/${retries}) after ${delay}ms delay...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          delay *= 2; // Экспоненциальная задержка
+          continue;
+        }
+
+        // Для других ошибок просто возвращаем ответ
+        return response;
+      }
+    } catch (error) {
+      attempt++;
+      console.error(`Network error during DeepSeek API call (attempt ${attempt}/${retries}):`, error);
+
+      if (attempt < retries) {
+        console.log(`Retrying after ${delay}ms delay...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 2;
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw new Error(`Failed to reach DeepSeek API after ${retries} attempts`);
+}
+
+export function findSimilarCodeInDiff(
+  file: { changes: { added: string[][], deleted: string[][] } | null, content?: string },
+  code: string,
+  threshold: number = 0.7
+): { similarity: number, line: number, column: number, patch: string } | null {
+  // Вывести информацию о поиске для диагностики
+  console.log(`Finding similar code in diff with threshold=${threshold}`);
+  console.log(`Code to find (${code.length} chars): ${code.substring(0, 50)}${code.length > 50 ? '...' : ''}`);
+
+  let lines: string[] = [];
+  let changes: { start: number, end: number, content: string }[] = [];
+
+  if (file.changes) {
+    // Преобразуем добавленные изменения в формат для поиска
+    if (file.changes.added && file.changes.added.length > 0) {
+      for (const block of file.changes.added) {
+        if (block.length >= 2) {
+          const start = parseInt(block[0]);
+          const content = block.slice(1).join('\n');
+          changes.push({ start, end: start + block.length - 2, content });
+        }
+      }
+    }
+
+    // Если есть полное содержимое файла, используем его
+    if (file.content) {
+      lines = file.content.split('\n');
+    } else {
+      // Иначе просто соберем строки из всех блоков изменений
+      const maxLine = Math.max(...changes.map(change => change.end));
+      lines = new Array(maxLine + 1).fill('');
+      for (const change of changes) {
+        const changeLines = change.content.split('\n');
+        for (let i = 0; i < changeLines.length; i++) {
+          lines[change.start + i] = changeLines[i];
+        }
+      }
+    }
+  } else if (file.content) {
+    lines = file.content.split('\n');
+    // Считаем весь файл как одно изменение
+    changes.push({ start: 0, end: lines.length - 1, content: file.content });
+  } else {
+    console.warn('File has no changes or content to search in');
+    return null;
+  }
+
+  console.log(`Found ${changes.length} change blocks to search within`);
+
+  let bestMatch = { similarity: 0, line: 0, column: 0, patch: '' };
+
+  // Поиск по каждому блоку изменений
+  for (const change of changes) {
+    const changeContent = change.content;
+    const similarity = calculateSimilarity(changeContent, code);
+
+    // Для диагностики выводим информацию о лучших совпадениях
+    if (similarity > 0.5) {
+      console.log(`Found potential match with similarity ${similarity.toFixed(3)} at line ${change.start + 1}`);
+    }
+
+    if (similarity > bestMatch.similarity) {
+      bestMatch = {
+        similarity,
+        line: change.start + 1,
+        column: 1,
+        patch: changeContent.substring(0, 100) + (changeContent.length > 100 ? '...' : '')
+      };
+    }
+  }
+
+  if (bestMatch.similarity >= threshold) {
+    console.log(`Best match found: similarity=${bestMatch.similarity.toFixed(3)}, line=${bestMatch.line}`);
+    return bestMatch;
+  }
+
+  if (bestMatch.similarity > 0) {
+    console.log(`No match above threshold. Best was: similarity=${bestMatch.similarity.toFixed(3)}, line=${bestMatch.line}`);
+  } else {
+    console.log('No similarity found at all');
+  }
+
+  return null;
+}
+
+export async function generateReviewComments(
+  diffData: Record<string, any>,
+  getFileContent: (path: string) => Promise<string | null>,
+  repo: string
+): Promise<ReviewComment[]> {
+  console.log(`Generating review comments for ${Object.keys(diffData).length} changed files in ${repo}`);
+
+  const comments: ReviewComment[] = [];
+
+  // Обработка каждого файла в диффе
+  for (const [filePath, fileChanges] of Object.entries(diffData)) {
+    console.log(`Processing file: ${filePath}`);
+
+    // Проверяем, есть ли в файле изменения
+    const changes = fileChanges.changes;
+    if (!changes || (!changes.added || changes.added.length === 0)) {
+      console.log(`- Skipping file with no added changes: ${filePath}`);
+      continue;
+    }
+
+    // Получаем содержимое файла если возможно
+    let fileContent: string | null = null;
+    try {
+      fileContent = await getFileContent(filePath);
+      console.log(`- File content retrieved: ${fileContent ? fileContent.length : 0} bytes`);
+    } catch (e) {
+      console.warn(`- Could not get content for ${filePath}:`, e);
+    }
+
+    // Собираем блоки добавленного кода для анализа
+    const addedCodeBlocks: string[] = [];
+    for (const block of changes.added) {
+      if (block.length >= 2) {
+        const content = block.slice(1).join('\n');
+        if (content.trim().length > 0) {
+          addedCodeBlocks.push(content);
+        }
+      }
+    }
+
+    if (addedCodeBlocks.length === 0) {
+      console.log(`- No meaningful added code blocks in ${filePath}`);
+      continue;
+    }
+
+    console.log(`- Found ${addedCodeBlocks.length} code blocks to analyze`);
+
+    try {
+      // Анализируем код с помощью DeepSeek API
+      const aiComments = await generateCommentsForChanges(
+        filePath,
+        addedCodeBlocks.join('\n\n'),
+        fileContent,
+        repo
+      );
+
+      console.log(`- AI generated ${aiComments.length} comments for ${filePath}`);
+
+      // Преобразуем AI-комментарии в формат ReviewComment
+      for (const aiComment of aiComments) {
+        // Находим близкое совпадение в диффе
+        const match = findSimilarCodeInDiff(
+          { changes, content: fileContent || undefined },
+          aiComment.code,
+          0.7 // Порог похожести
+        );
+
+        if (match) {
+          comments.push({
+            path: filePath,
+            body: aiComment.comment,
+            line: match.line,
+            similarity: match.similarity,
+            originalCode: aiComment.code,
+            matchedPatch: match.patch
+          });
+          console.log(`- Added comment for line ${match.line} with similarity ${match.similarity.toFixed(3)}`);
+        } else {
+          console.log(`- Could not find a match for comment: ${aiComment.comment.substring(0, 50)}...`);
+        }
+      }
+    } catch (error) {
+      console.error(`Error generating comments for ${filePath}:`, error);
+    }
+  }
+
+  console.log(`Generated ${comments.length} total comments across all files`);
+  return comments;
 } 

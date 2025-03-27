@@ -5,7 +5,15 @@ import { createControllerFromEnv } from './controller';
 dotenv.config();
 
 async function main() {
+  // Записываем дату и время запуска для диагностики
+  console.log(`=== AI Code Review started at ${new Date().toISOString()} ===`);
+  console.log('NODE_ENV:', process.env.NODE_ENV || 'not set');
+
   try {
+    // Выводим версии для диагностики
+    console.log(`Node.js version: ${process.version}`);
+    console.log(`Platform: ${process.platform}, Architecture: ${process.arch}`);
+
     // Создаем контроллер используя переменные окружения
     const controller = createControllerFromEnv();
 
@@ -16,11 +24,14 @@ async function main() {
       throw new Error('Missing event type. Set either GITHUB_EVENT_NAME or GITLAB_EVENT_TYPE');
     }
 
+    console.log(`Detected event type: ${eventType}`);
+
     // Данные события зависят от платформы
     let eventData: any = {};
 
     // Разбираем данные события из переменных окружения
     if (process.env.GITHUB_EVENT_NAME) {
+      console.log('Platform: GitHub');
       // GitHub события
       switch (eventType) {
         case 'pull_request':
@@ -28,6 +39,7 @@ async function main() {
           if (!PR_NUMBER) {
             throw new Error('PR_NUMBER is required for pull_request events');
           }
+          console.log(`Processing GitHub Pull Request #${PR_NUMBER}`);
           eventData = {
             pull_request: {
               number: Number(PR_NUMBER)
@@ -40,6 +52,7 @@ async function main() {
           if (!COMMENT_ID) {
             throw new Error('COMMENT_ID is required for pull_request_review_comment events');
           }
+          console.log(`Processing GitHub Pull Request Comment #${COMMENT_ID}`);
           eventData = {
             comment: {
               id: Number(COMMENT_ID)
@@ -52,6 +65,7 @@ async function main() {
           return;
       }
     } else if (process.env.GITLAB_EVENT_TYPE) {
+      console.log('Platform: GitLab');
       // GitLab события
       switch (eventType) {
         case 'merge_request':
@@ -59,6 +73,7 @@ async function main() {
           if (!MR_IID) {
             throw new Error('GITLAB_MERGE_REQUEST_IID is required for merge_request events');
           }
+          console.log(`Processing GitLab Merge Request !${MR_IID}`);
           eventData = {
             object_attributes: {
               iid: MR_IID
@@ -75,6 +90,7 @@ async function main() {
             throw new Error('GITLAB_MERGE_REQUEST_IID, GITLAB_DISCUSSION_ID and GITLAB_NOTE_ID are required for note events');
           }
 
+          console.log(`Processing GitLab Merge Request Comment: MR !${MR_IID2}, Discussion: ${DISCUSSION_ID}, Note: ${NOTE_ID}`);
           eventData = {
             merge_request: {
               iid: MR_IID2
@@ -93,13 +109,35 @@ async function main() {
       }
     }
 
+    console.log('Event data prepared, starting processing...');
+
+    // Засекаем время на выполнение
+    const startTime = Date.now();
+
     // Обрабатываем событие
     await controller.processEvent(eventType, eventData);
 
+    const elapsedTime = (Date.now() - startTime) / 1000;
+    console.log(`Event processing completed in ${elapsedTime.toFixed(2)} seconds`);
+    console.log(`=== AI Code Review completed at ${new Date().toISOString()} ===`);
   } catch (error) {
     console.error('Error during code review:', error);
+
+    // Выводим трассировку стека для более простой отладки
+    if (error instanceof Error) {
+      console.error('Error stack:', error.stack);
+    }
+
+    // Устанавливаем статус выхода, чтобы CI/CD пайплайн знал о неудаче
     process.exit(1);
   }
 }
 
+// Регистрируем обработчик необработанных исключений
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+  process.exit(1);
+});
+
+// Запускаем
 main(); 

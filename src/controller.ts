@@ -47,19 +47,35 @@ export class CodeReviewController {
     const files = await this.platform.getChangedFiles(prId);
     console.log(`Found ${files.length} changed files`);
 
+    // Фильтруем файлы, исключая те, у которых нет патча
+    const filesWithPatches = files.filter(file => !!file.patch);
+    if (filesWithPatches.length < files.length) {
+      console.log(`${files.length - filesWithPatches.length} files without patches excluded from analysis`);
+    }
+
     // Анализируем каждый файл
     const allComments: ReviewComment[] = [];
 
     // Добавляем логирование для отслеживания измененных строк
     console.log('==== Detailed file analysis ====');
 
-    for (const file of files) {
+    for (const file of filesWithPatches) {
       console.log(`Analyzing file: ${file.path}`);
 
       try {
         // Добавляем логирование информации о файле
         console.log(`File details: ${file.path}`);
         console.log(`Has patch: ${!!file.patch}`);
+
+        if (file.patch) {
+          // Логируем первые несколько строк патча для диагностики
+          const patchPreview = file.patch.split('\n').slice(0, 3).join('\n');
+          console.log(`Patch preview: ${patchPreview}...`);
+
+          // Отображаем измененные строки
+          const changedLines = parseDiffToChangedLines(file.patch);
+          console.log(`Changed lines: ${[...changedLines].slice(0, 10).join(', ')}${changedLines.size > 10 ? '...' : ''}`);
+        }
 
         // Получаем результаты анализа
         const fileComments = await analyzeCodeContent(
@@ -69,17 +85,19 @@ export class CodeReviewController {
           this.config.deepseekApiUrl
         );
 
-        // Фильтруем комментарии, оставляя только те, которые относятся к измененным строкам
-        if (file.patch) {
-          const changedLines = parseDiffToChangedLines(file.patch);
-          const validComments = fileComments.filter(comment => changedLines.has(comment.line));
+        // Теперь мы гарантированно имеем файл с патчем
+        const changedLines = parseDiffToChangedLines(file.patch!);
 
-          console.log(`Found ${fileComments.length} issues, ${validComments.length} in changed lines`);
-          allComments.push(...validComments);
-        } else {
-          console.log(`Found ${fileComments.length} issues (no patch available)`);
-          allComments.push(...fileComments);
+        // Добавляем детальное логирование каждого комментария
+        for (const comment of fileComments) {
+          const inChangedLines = changedLines.has(comment.line);
+          console.log(`Comment for line ${comment.line}: ${inChangedLines ? 'VALID (in changed lines)' : 'SKIPPED (not in changed lines)'}`);
         }
+
+        const validComments = fileComments.filter(comment => changedLines.has(comment.line));
+
+        console.log(`Found ${fileComments.length} issues, ${validComments.length} in changed lines`);
+        allComments.push(...validComments);
       } catch (error) {
         console.error(`Error analyzing file ${file.path}:`, error);
         if (error instanceof Error) {

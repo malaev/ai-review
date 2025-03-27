@@ -15,23 +15,13 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 }) : function(o, v) {
     o["default"] = v;
 });
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.CodeReviewController = void 0;
 exports.createControllerFromEnv = createControllerFromEnv;
@@ -61,32 +51,61 @@ class CodeReviewController {
         // Получаем измененные файлы
         const files = await this.platform.getChangedFiles(prId);
         console.log(`Found ${files.length} changed files`);
+        // Фильтруем файлы, исключая те, у которых нет патча
+        const filesWithPatches = files.filter(file => !!file.patch);
+        if (filesWithPatches.length < files.length) {
+            console.log(`${files.length - filesWithPatches.length} files without patches excluded from analysis`);
+        }
         // Анализируем каждый файл
         const allComments = [];
-        for (const file of files) {
+        // Добавляем логирование для отслеживания измененных строк
+        console.log('==== Detailed file analysis ====');
+        for (const file of filesWithPatches) {
             console.log(`Analyzing file: ${file.path}`);
             try {
+                // Добавляем логирование информации о файле
+                console.log(`File details: ${file.path}`);
+                console.log(`Has patch: ${!!file.patch}`);
+                if (file.patch) {
+                    // Логируем первые несколько строк патча для диагностики
+                    const patchPreview = file.patch.split('\n').slice(0, 3).join('\n');
+                    console.log(`Patch preview: ${patchPreview}...`);
+                    // Отображаем измененные строки
+                    const changedLines = (0, utils_1.parseDiffToChangedLines)(file.patch);
+                    console.log(`Changed lines: ${[...changedLines].slice(0, 10).join(', ')}${changedLines.size > 10 ? '...' : ''}`);
+                }
                 // Получаем результаты анализа
                 const fileComments = await (0, utils_1.analyzeCodeContent)(file.path, file.content, this.config.deepseekApiKey, this.config.deepseekApiUrl);
-                // Фильтруем комментарии, оставляя только те, которые относятся к измененным строкам
-                if (file.patch) {
-                    const changedLines = (0, utils_1.parseDiffToChangedLines)(file.patch);
-                    const validComments = fileComments.filter(comment => changedLines.has(comment.line));
-                    console.log(`Found ${fileComments.length} issues, ${validComments.length} in changed lines`);
-                    allComments.push(...validComments);
+                // Теперь мы гарантированно имеем файл с патчем
+                const changedLines = (0, utils_1.parseDiffToChangedLines)(file.patch);
+                // Добавляем детальное логирование каждого комментария
+                for (const comment of fileComments) {
+                    const inChangedLines = changedLines.has(comment.line);
+                    console.log(`Comment for line ${comment.line}: ${inChangedLines ? 'VALID (in changed lines)' : 'SKIPPED (not in changed lines)'}`);
                 }
-                else {
-                    console.log(`Found ${fileComments.length} issues (no patch available)`);
-                    allComments.push(...fileComments);
-                }
+                const validComments = fileComments.filter(comment => changedLines.has(comment.line));
+                console.log(`Found ${fileComments.length} issues, ${validComments.length} in changed lines`);
+                allComments.push(...validComments);
             }
             catch (error) {
                 console.error(`Error analyzing file ${file.path}:`, error);
+                if (error instanceof Error) {
+                    console.error('Error stack:', error.stack);
+                }
             }
         }
         // Создаем ревью с комментариями
         if (allComments.length > 0) {
             console.log(`Creating ${allComments.length} review comments`);
+            // Логируем сводную информацию о комментариях
+            const commentsByFile = {};
+            for (const comment of allComments) {
+                commentsByFile[comment.path] = (commentsByFile[comment.path] || 0) + 1;
+            }
+            console.log('Comment distribution by file:');
+            for (const [path, count] of Object.entries(commentsByFile)) {
+                console.log(`- ${path}: ${count} comments`);
+            }
             await this.platform.createReview(prId, allComments);
             console.log('Review created successfully');
         }
