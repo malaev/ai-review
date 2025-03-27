@@ -26,6 +26,14 @@ async function main() {
 
     console.log(`Detected event type: ${eventType}`);
 
+    // Проверяем наличие переменной LAST_ANALYZED_COMMIT
+    if (process.env.LAST_ANALYZED_COMMIT) {
+      console.log(`LAST_ANALYZED_COMMIT is set to: ${process.env.LAST_ANALYZED_COMMIT}`);
+      console.log('Only changes since this commit will be analyzed');
+    } else {
+      console.log('LAST_ANALYZED_COMMIT is not set, analyzing all changes in PR/MR');
+    }
+
     // Данные события зависят от платформы
     let eventData: any = {};
 
@@ -116,6 +124,12 @@ async function main() {
 
     // Обрабатываем событие
     await controller.processEvent(eventType, eventData);
+
+    // После успешного выполнения выводим текущий коммит
+    if (eventType === 'pull_request' || eventType === 'merge_request') {
+      console.log('For future runs, to analyze only new changes, set:');
+      console.log('export LAST_ANALYZED_COMMIT=$(git rev-parse HEAD)');
+    }
 
     const elapsedTime = (Date.now() - startTime) / 1000;
     console.log(`Event processing completed in ${elapsedTime.toFixed(2)} seconds`);

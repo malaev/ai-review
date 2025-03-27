@@ -1,4 +1,4 @@
-import { CodeReviewPlatform, createPlatformAdapter } from './adapter';
+import { CodeReviewPlatform, createPlatformAdapter, CodeFile } from './adapter';
 import { ReviewComment, analyzeCodeContent, generateReplyForComment, parseDiffToChangedLines } from './utils';
 import * as dotenv from 'dotenv';
 
@@ -43,9 +43,18 @@ export class CodeReviewController {
   async handlePullRequestEvent(prId: number | string): Promise<void> {
     console.log(`Analyzing ${this.config.platform === 'github' ? 'PR' : 'MR'} #${prId}...`);
 
-    // Получаем измененные файлы
-    const files = await this.platform.getChangedFiles(prId);
-    console.log(`Found ${files.length} changed files`);
+    // Проверяем, есть ли предыдущие запуски и последние проанализированные коммиты
+    const lastAnalyzedCommit = process.env.LAST_ANALYZED_COMMIT;
+    console.log(`Last analyzed commit: ${lastAnalyzedCommit || 'none (analyzing entire PR)'}`);
+
+    // Получаем измененные файлы, с учетом последнего анализируемого коммита
+    const files = await this.platform.getChangedFiles(prId, lastAnalyzedCommit);
+    console.log(`Found ${files.length} changed files since last analysis`);
+
+    if (files.length === 0) {
+      console.log('No new changes to analyze');
+      return;
+    }
 
     // Фильтруем файлы, исключая те, у которых нет патча
     const filesWithPatches = files.filter(file => !!file.patch);
@@ -66,6 +75,7 @@ export class CodeReviewController {
         // Добавляем логирование информации о файле
         console.log(`File details: ${file.path}`);
         console.log(`Has patch: ${!!file.patch}`);
+        console.log(`Commits: ${file.commits ? file.commits.join(', ') : 'unknown'}`);
 
         if (file.patch) {
           // Логируем первые несколько строк патча для диагностики
@@ -106,6 +116,15 @@ export class CodeReviewController {
       }
     }
 
+    // Получаем текущий HEAD коммит для сохранения
+    let headCommit: string | null = null;
+    try {
+      headCommit = await this.platform.getCurrentCommit(prId);
+      console.log(`Current HEAD commit: ${headCommit}`);
+    } catch (error) {
+      console.error('Failed to get current commit:', error);
+    }
+
     // Создаем ревью с комментариями
     if (allComments.length > 0) {
       console.log(`Creating ${allComments.length} review comments`);
@@ -121,8 +140,27 @@ export class CodeReviewController {
         console.log(`- ${path}: ${count} comments`);
       }
 
+      // Добавляем информацию о текущем коммите в ревью, чтобы не анализировать этот коммит повторно
+      if (headCommit) {
+        console.log(`Adding review with comment to track current commit: ${headCommit}`);
+        // При необходимости можно добавить комментарий с информацией о текущем коммите
+        // allComments.push({
+        //   path: allComments[0].path,
+        //   line: allComments[0].line,
+        //   body: `AI Review completed for commit ${headCommit}`
+        // });
+      }
+
       await this.platform.createReview(prId, allComments);
       console.log('Review created successfully');
+
+      // Выводим информацию для сохранения текущего коммита
+      if (headCommit) {
+        console.log('===========================================');
+        console.log('To only analyze new changes in future runs:');
+        console.log(`export LAST_ANALYZED_COMMIT=${headCommit}`);
+        console.log('===========================================');
+      }
     } else {
       console.log('No issues found, no review created');
     }

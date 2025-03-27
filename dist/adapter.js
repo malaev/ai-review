@@ -43,25 +43,88 @@ class GitHubAdapter {
     /**
      * Получить измененные файлы в PR
      */
-    async getChangedFiles(prNumber) {
+    async getChangedFiles(prNumber, sinceCommit) {
+        console.log(`Getting changed files for PR #${prNumber}${sinceCommit ? ` since commit ${sinceCommit}` : ''}`);
+        let changedFiles = [];
+        // Первым делом получаем список всех измененных файлов в PR
         const { data: files } = await (0, utils_1.withRetry)(() => this.octokit.pulls.listFiles({
             owner: this.owner,
             repo: this.repo,
             pull_number: prNumber,
             per_page: 100, // Увеличиваем количество файлов на страницу
         }));
+        console.log(`Retrieved ${files.length} total changed files from GitHub API for PR #${prNumber}`);
+        // Если указан коммит для фильтрации, нам нужно получить только файлы, измененные после этого коммита
+        if (sinceCommit) {
+            try {
+                // Получаем текущий HEAD коммит PR
+                const headCommit = await this.getCurrentCommit(prNumber);
+                if (headCommit === sinceCommit) {
+                    console.log('Current HEAD commit is the same as last analyzed commit, no new changes');
+                    return [];
+                }
+                // Получаем список коммитов между sinceCommit и HEAD
+                const { data: commits } = await (0, utils_1.withRetry)(() => this.octokit.repos.compareCommits({
+                    owner: this.owner,
+                    repo: this.repo,
+                    base: sinceCommit,
+                    head: headCommit,
+                }));
+                console.log(`Found ${commits.commits.length} new commits since ${sinceCommit}`);
+                // Создаем множество файлов, которые были изменены в новых коммитах
+                const changedFilePaths = new Set();
+                const fileToCommits = new Map();
+                for (const commit of commits.commits) {
+                    // Получаем список измененных файлов в коммите
+                    try {
+                        const { data: commitData } = await (0, utils_1.withRetry)(() => this.octokit.repos.getCommit({
+                            owner: this.owner,
+                            repo: this.repo,
+                            ref: commit.sha,
+                        }));
+                        for (const file of commitData.files || []) {
+                            changedFilePaths.add(file.filename);
+                            // Привязываем коммит к файлу
+                            if (!fileToCommits.has(file.filename)) {
+                                fileToCommits.set(file.filename, []);
+                            }
+                            fileToCommits.get(file.filename).push(commit.sha.substring(0, 7));
+                        }
+                    }
+                    catch (e) {
+                        console.error(`Error getting commit details for ${commit.sha}:`, e);
+                    }
+                }
+                console.log(`Found ${changedFilePaths.size} unique files changed since ${sinceCommit}`);
+                // Фильтруем список файлов PR, оставляя только те, которые были изменены после lastAnalyzedCommit
+                changedFiles = files.filter(file => changedFilePaths.has(file.filename));
+                // Добавляем информацию о коммитах к каждому файлу
+                for (const file of changedFiles) {
+                    file.commits = fileToCommits.get(file.filename) || [];
+                }
+                console.log(`Filtered to ${changedFiles.length} files that were modified since ${sinceCommit}`);
+            }
+            catch (e) {
+                console.error(`Error filtering files by commit changes:`, e);
+                // Если произошла ошибка, просто используем все файлы из PR
+                changedFiles = files;
+            }
+        }
+        else {
+            // Если коммит для фильтрации не указан, используем все файлы из PR
+            changedFiles = files;
+        }
         const result = [];
-        console.log(`Retrieved ${files.length} changed files from GitHub API for PR #${prNumber}`);
         // Считаем статистику для лучшей диагностики
         const stats = {
-            total: files.length,
+            total: changedFiles.length,
             ts: 0,
             js: 0,
             other: 0,
             withPatch: 0,
             withoutPatch: 0
         };
-        for (const file of files) {
+        for (const file of changedFiles) {
             // Обновляем статистику
             if (file.filename.match(/\.(ts|tsx)$/)) {
                 stats.ts++;
@@ -83,6 +146,9 @@ class GitHubAdapter {
                 try {
                     console.log(`Processing file: ${file.filename}`);
                     console.log(`- Status: ${file.status}, Changes: +${file.additions}/-${file.deletions}, Has patch: ${Boolean(file.patch)}`);
+                    if (file.commits) {
+                        console.log(`- Related commits: ${file.commits.join(', ')}`);
+                    }
                     if (file.status === 'removed') {
                         console.log(`- Skipping removed file: ${file.filename}`);
                         continue;
@@ -103,7 +169,8 @@ class GitHubAdapter {
                     result.push({
                         path: file.filename,
                         content,
-                        patch: file.patch
+                        patch: file.patch,
+                        commits: file.commits
                     });
                 }
                 catch (error) {
@@ -113,7 +180,8 @@ class GitHubAdapter {
                         result.push({
                             path: file.filename,
                             content: '', // Пустое содержимое
-                            patch: file.patch
+                            patch: file.patch,
+                            commits: file.commits
                         });
                     }
                 }
@@ -129,6 +197,17 @@ class GitHubAdapter {
         console.log(`- With patch: ${stats.withPatch}, Without patch: ${stats.withoutPatch}`);
         console.log(`- Processed: ${result.length} files`);
         return result;
+    }
+    /**
+     * Получить текущий HEAD коммит PR
+     */
+    async getCurrentCommit(prNumber) {
+        const { data: pr } = await (0, utils_1.withRetry)(() => this.octokit.pulls.get({
+            owner: this.owner,
+            repo: this.repo,
+            pull_number: prNumber,
+        }));
+        return pr.head.sha;
     }
     /**
      * Проверяет, что комментарий может быть добавлен к строке
@@ -460,13 +539,71 @@ class GitLabAdapter {
     /**
      * Получить измененные файлы в MR
      */
-    async getChangedFiles(mergeRequestIid) {
+    async getChangedFiles(mergeRequestIid, sinceCommit) {
+        console.log(`Getting changed files for MR !${mergeRequestIid}${sinceCommit ? ` since commit ${sinceCommit}` : ''}`);
+        // Получаем данные о изменениях в MR
         const endpoint = `/projects/${this.projectId}/merge_requests/${mergeRequestIid}/changes`;
         const data = await this.makeRequest(endpoint);
+        // Если указан коммит для фильтрации, получаем только файлы, измененные после этого коммита
+        let filteredChanges = data.changes;
+        if (sinceCommit) {
+            try {
+                // Получаем текущий HEAD коммит MR
+                const headCommit = await this.getCurrentCommit(mergeRequestIid);
+                if (headCommit === sinceCommit) {
+                    console.log('Current HEAD commit is the same as last analyzed commit, no new changes');
+                    return [];
+                }
+                // Получаем список коммитов в MR
+                const commitsEndpoint = `/projects/${this.projectId}/merge_requests/${mergeRequestIid}/commits`;
+                const { commits } = await this.makeRequest(commitsEndpoint);
+                // Создаем множество файлов, измененных после указанного коммита
+                const changedFilePaths = new Set();
+                const fileToCommits = new Map();
+                // Находим индекс lastAnalyzedCommit в списке коммитов
+                const lastCommitIndex = commits.findIndex(c => c.id === sinceCommit || c.short_id === sinceCommit);
+                if (lastCommitIndex === -1) {
+                    console.warn(`Commit ${sinceCommit} not found in MR !${mergeRequestIid}`);
+                }
+                else {
+                    // Получаем новые коммиты (после lastAnalyzedCommit)
+                    const newCommits = commits.slice(0, lastCommitIndex);
+                    console.log(`Found ${newCommits.length} new commits since ${sinceCommit}`);
+                    // Для каждого коммита получаем измененные файлы
+                    for (const commit of newCommits) {
+                        try {
+                            const commitEndpoint = `/projects/${this.projectId}/repository/commits/${commit.id}/diff`;
+                            const { diffs } = await this.makeRequest(commitEndpoint);
+                            for (const diff of diffs) {
+                                changedFilePaths.add(diff.new_path);
+                                // Привязываем коммит к файлу
+                                if (!fileToCommits.has(diff.new_path)) {
+                                    fileToCommits.set(diff.new_path, []);
+                                }
+                                fileToCommits.get(diff.new_path).push(commit.short_id);
+                            }
+                        }
+                        catch (e) {
+                            console.error(`Error getting commit details for ${commit.id}:`, e);
+                        }
+                    }
+                    // Фильтруем изменения MR, оставляя только файлы, измененные в новых коммитах
+                    filteredChanges = data.changes.filter(change => changedFilePaths.has(change.new_path));
+                    console.log(`Filtered to ${filteredChanges.length} files that were modified since ${sinceCommit}`);
+                }
+            }
+            catch (e) {
+                console.error(`Error filtering files by commit changes:`, e);
+                // В случае ошибки используем все файлы
+                filteredChanges = data.changes;
+            }
+        }
         const result = [];
-        for (const change of data.changes) {
+        // Обрабатываем изменения
+        for (const change of filteredChanges) {
             if (change.new_path.match(/\.(ts|tsx|js|jsx)$/)) {
                 try {
+                    console.log(`Processing file: ${change.new_path}`);
                     const content = await this.getFileContent(change.new_path, `refs/merge-requests/${mergeRequestIid}/head`);
                     result.push({
                         path: change.new_path,
@@ -478,8 +615,19 @@ class GitLabAdapter {
                     console.error(`Error getting content for ${change.new_path}:`, error);
                 }
             }
+            else {
+                console.log(`Skipping non-TypeScript/JavaScript file: ${change.new_path}`);
+            }
         }
         return result;
+    }
+    /**
+     * Получить текущий HEAD коммит MR
+     */
+    async getCurrentCommit(mergeRequestIid) {
+        const endpoint = `/projects/${this.projectId}/merge_requests/${mergeRequestIid}`;
+        const mr = await this.makeRequest(endpoint);
+        return mr.sha;
     }
     /**
      * Создать ревью с комментариями

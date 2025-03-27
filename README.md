@@ -8,6 +8,7 @@
 - 🔒 Проверка безопасности
 - ⚡ Рекомендации по производительности
 - 💬 Интерактивные ответы на вопросы в комментариях
+- 🔄 Поддержка анализа только новых изменений
 
 ## Как использовать
 
@@ -45,9 +46,83 @@ jobs:
         GITHUB_EVENT_NAME: ${{ github.event_name }}
         COMMENT_ID: ${{ github.event.comment.id }}
         REPLY_TO_ID: ${{ github.event.comment.in_reply_to_id }}
+        # Optional: Analyze only changes since specific commit
+        # LAST_ANALYZED_COMMIT: ${{ env.PREVIOUS_HEAD_SHA }}
       with:
         DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+### Анализ только новых изменений
+
+Вы можете настроить бота для анализа только новых изменений с момента последнего запуска, используя переменную окружения `LAST_ANALYZED_COMMIT`. Это особенно полезно для больших PR, где вы внесли исправления по первым комментариям бота и хотите, чтобы он проверил только новые изменения.
+
+**Пример workflow с сохранением последнего проанализированного коммита:**
+
+```yaml
+name: Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    # Получаем последний проанализированный коммит из артефакта (если есть)
+    - name: Download last analyzed commit
+      uses: actions/download-artifact@v3
+      continue-on-error: true
+      with:
+        name: last-analyzed-commit
+        path: /tmp
+        
+    - name: Load last analyzed commit
+      id: load-commit
+      continue-on-error: true
+      run: |
+        if [ -f "/tmp/last_analyzed_commit.txt" ]; then
+          echo "LAST_COMMIT=$(cat /tmp/last_analyzed_commit.txt)" >> $GITHUB_ENV
+          echo "Found last analyzed commit: $(cat /tmp/last_analyzed_commit.txt)"
+        else
+          echo "No previous commit found, analyzing entire PR"
+        fi
+
+    - name: AI Code Review
+      uses: malaev/ai-review@v0.1.34
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        COMMENT_ID: ${{ github.event.comment.id }}
+        LAST_ANALYZED_COMMIT: ${{ env.LAST_COMMIT }}
+      
+    # Сохраняем текущий HEAD как последний проанализированный коммит
+    - name: Save current HEAD commit
+      if: github.event_name == 'pull_request'
+      run: |
+        git rev-parse HEAD > /tmp/last_analyzed_commit.txt
+        echo "Saved current HEAD commit: $(cat /tmp/last_analyzed_commit.txt)"
+        
+    - name: Upload last analyzed commit
+      if: github.event_name == 'pull_request'
+      uses: actions/upload-artifact@v3
+      with:
+        name: last-analyzed-commit
+        path: /tmp/last_analyzed_commit.txt
+        retention-days: 1
 ```
 
 ## Как это работает
@@ -61,6 +136,11 @@ jobs:
 
 3. Чтобы задать вопрос по комментарию:
    - Начните ваш вопрос с `@ai` или `/ai`
+
+4. При повторном запуске с указанием `LAST_ANALYZED_COMMIT`:
+   - Бот анализирует только файлы, измененные после указанного коммита
+   - Комментарии добавляются только к новым или измененным строкам
+   - Это позволяет сфокусироваться только на новых изменениях
 
 ## Что анализируется
 
