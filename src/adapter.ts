@@ -186,6 +186,8 @@ export class GitHubAdapter implements CodeReviewPlatform {
       if (githubError.status === 422) {
         console.error('Failed to create review. Some comments might be outside of the diff.');
 
+        console.log('Error:', JSON.stringify(githubError));
+
         // Попытаемся создать комментарии по одному, чтобы определить проблемные
         console.log('Trying to create comments one by one to identify problematic ones...');
 
