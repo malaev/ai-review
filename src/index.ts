@@ -1,6 +1,24 @@
 import { Octokit } from '@octokit/rest';
 import * as dotenv from 'dotenv';
 import fetch from 'node-fetch';
+import {
+  MAX_RETRIES,
+  RETRY_DELAY,
+  ReviewComment,
+  AnalysisIssue,
+  AnalysisResponse,
+  AnalysisIssueWithCode,
+  AnalysisResponseWithCode,
+  DeepSeekResponse,
+  delay,
+  withRetry,
+  levenshteinDistance,
+  normalizeCode,
+  findMostSimilarLine,
+  analyzeCodeContent,
+  generateReplyForComment,
+  parseDiffToChangedLines
+} from './utils';
 
 // Загружаем переменные окружения
 dotenv.config();
@@ -39,10 +57,6 @@ const octokit = new Octokit({
 
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
 
-// Максимальное количество попыток для API запросов
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000;
-
 interface PullRequestInfo {
   owner: string;
   repo: string;
@@ -53,14 +67,6 @@ interface CodeAnalysis {
   quality: string[];
   security: string[];
   performance: string[];
-}
-
-interface DeepSeekResponse {
-  choices: Array<{
-    message: {
-      content: string;
-    };
-  }>;
 }
 
 interface ConversationContext {
@@ -74,106 +80,8 @@ interface ConversationContext {
   }>;
 }
 
-interface ReviewComment {
-  path: string;
-  line: number;
-  body: string;
-}
-
-interface AnalysisIssue {
-  line: number;
-  type: 'quality' | 'security' | 'performance';
-  description: string;
-}
-
-interface AnalysisResponse {
-  issues: AnalysisIssue[];
-}
-
 // Хранилище контекстов обсуждений
 const conversationContexts = new Map<string, ConversationContext>();
-
-// Утилита для задержки
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-// Утилита для повторных попыток
-async function withRetry<T>(operation: () => Promise<T>, retries = MAX_RETRIES): Promise<T> {
-  try {
-    return await operation();
-  } catch (error) {
-    if (retries > 0) {
-      console.log(`Повторная попытка (осталось ${retries})...`);
-      await delay(RETRY_DELAY);
-      return withRetry(operation, retries - 1);
-    }
-    throw error;
-  }
-}
-
-// Функция для вычисления расстояния Левенштейна между строками
-function levenshteinDistance(a: string, b: string): number {
-  const matrix = Array(b.length + 1).fill(null).map(() => Array(a.length + 1).fill(null));
-
-  for (let i = 0; i <= a.length; i++) matrix[0][i] = i;
-  for (let j = 0; j <= b.length; j++) matrix[j][0] = j;
-
-  for (let j = 1; j <= b.length; j++) {
-    for (let i = 1; i <= a.length; i++) {
-      const substitutionCost = a[i - 1] === b[j - 1] ? 0 : 1;
-      matrix[j][i] = Math.min(
-        matrix[j][i - 1] + 1, // deletion
-        matrix[j - 1][i] + 1, // insertion
-        matrix[j - 1][i - 1] + substitutionCost // substitution
-      );
-    }
-  }
-
-  return matrix[b.length][a.length];
-}
-
-// Функция для нормализации строки кода (убирает пробелы, табуляцию и т.д.)
-function normalizeCode(code: string): string {
-  return code.trim().replace(/\s+/g, ' ');
-}
-
-// Функция для поиска наиболее похожей строки
-function findMostSimilarLine(targetLine: string, fileLines: string[], startLine: number, endLine: number): { lineNumber: number, similarity: number } {
-  let bestMatch = {
-    lineNumber: startLine,
-    similarity: Infinity,
-  };
-
-  const normalizedTarget = normalizeCode(targetLine);
-
-  // Ищем в диапазоне ±30 строк от предполагаемой позиции
-  const searchStart = Math.max(0, startLine - 30);
-  const searchEnd = Math.min(fileLines.length, endLine + 30);
-
-  for (let i = searchStart; i < searchEnd; i++) {
-    const normalizedLine = normalizeCode(fileLines[i]);
-    const distance = levenshteinDistance(normalizedTarget, normalizedLine);
-
-    // Нормализуем расстояние относительно длины строк
-    const similarity = distance / Math.max(normalizedTarget.length, normalizedLine.length);
-
-    if (similarity < bestMatch.similarity) {
-      bestMatch = {
-        lineNumber: i + 1, // +1 потому что нумерация строк с 1
-        similarity: similarity,
-      };
-    }
-  }
-
-  return bestMatch;
-}
-
-interface AnalysisIssueWithCode extends AnalysisIssue {
-  code: string;  // Добавляем поле для хранения проблемной строки
-}
-
-interface AnalysisResponseWithCode {
-  issues: AnalysisIssueWithCode[];
-}
 
 async function analyzeFile(file: { filename: string, patch?: string }, prInfo: PullRequestInfo): Promise<ReviewComment[]> {
   try {
@@ -189,160 +97,17 @@ async function analyzeFile(file: { filename: string, patch?: string }, prInfo: P
       throw new Error('File content not found');
     }
 
-    let content = Buffer.from(fileContent.content, 'base64').toString();
+    const content = Buffer.from(fileContent.content, 'base64').toString();
 
-    // Проверяем размер контента
-    if (content.length > 30000) {
-      console.log(`File ${file.filename} is too large (${content.length} chars), analyzing first 30000 chars`);
-      content = content.slice(0, 30000);
-    }
+    // Используем функцию из utils.ts для анализа содержимого файла
+    const comments = await analyzeCodeContent(
+      file.filename,
+      content,
+      DEEPSEEK_API_KEY!,
+      DEEPSEEK_API_URL
+    );
 
-    const lines = content.split('\n');
-
-    // Создаем карту соответствия строк в файле и в diff
-    const lineMap = new Map<number, number>();
-    if (file.patch) {
-      const diffLines = file.patch.split('\n');
-      let fileLineNum = 0;
-      let diffLineNum = 0;
-
-      for (const line of diffLines) {
-        if (line.startsWith('@@')) {
-          const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-          if (match) {
-            fileLineNum = parseInt(match[1], 10) - 1;
-          }
-          continue;
-        }
-
-        if (!line.startsWith('-')) {
-          lineMap.set(fileLineNum + 1, diffLineNum + 1);
-          fileLineNum++;
-        }
-        diffLineNum++;
-      }
-    }
-
-    const systemPrompt = `Вы опытный ревьюер React + TypeScript проектов.
-      Проанализируйте код и найдите только серьезные проблемы, которые могут привести к багам или проблемам с производительностью.
-      
-      НЕ НУЖНО комментировать:
-      - Стилистические проблемы
-      - Отсутствие типов там, где они очевидны из контекста
-      - Использование console.log
-      - Мелкие предупреждения линтера
-      - Отсутствие документации
-      - Форматирование кода
-      
-      Сфокусируйтесь на:
-      - Утечках памяти
-      - Неправильном использовании React хуков
-      - Потенциальных race conditions
-      - Проблемах безопасности
-      - Серьезных проблемах производительности
-      - Логических ошибках в бизнес-логике
-      
-      ВАЖНО: Для каждой проблемы обязательно укажите:
-      1. Точный номер строки (line)
-      2. Саму проблемную строку кода (code)
-      3. Тип проблемы (type)
-      4. Описание проблемы (description)
-      
-      Ответ должен быть в формате JSON со следующей структурой:
-      {
-        "issues": [
-          {
-            "line": number,
-            "code": "string", // Точная строка кода с проблемой
-            "type": "quality" | "security" | "performance",
-            "description": "string"
-          }
-        ]
-      }`;
-
-    const response = await withRetry(() => fetch(DEEPSEEK_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'deepseek-chat',
-        messages: [
-          {
-            role: 'system',
-            content: systemPrompt,
-          },
-          {
-            role: 'user',
-            content: content,
-          },
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.3,
-        max_tokens: 4000,
-      }),
-    }));
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('DeepSeek API error details:', {
-        status: response.status,
-        statusText: response.statusText,
-        headers: Object.fromEntries(response.headers.entries()),
-        body: errorText,
-      });
-      throw new Error(`DeepSeek API error: ${response.status} ${response.statusText}\n${errorText}`);
-    }
-
-    const data = await response.json() as { choices: [{ message: { content: string } }] };
-    let analysis;
-
-    try {
-      analysis = JSON.parse(data.choices[0].message.content) as AnalysisResponseWithCode;
-    } catch (error) {
-      console.error('Failed to parse DeepSeek response:', error);
-      console.log('Raw response:', data.choices[0].message.content);
-      return [];
-    }
-
-    if (!analysis.issues || !Array.isArray(analysis.issues)) {
-      console.error('Invalid analysis format:', analysis);
-      return [];
-    }
-
-    // Разбиваем файл на строки для поиска
-    const fileLines = content.split('\n');
-
-    return analysis.issues
-      .filter((issue): issue is AnalysisIssueWithCode =>
-        typeof issue.line === 'number' &&
-        typeof issue.code === 'string' &&
-        typeof issue.type === 'string' &&
-        typeof issue.description === 'string'
-      )
-      .map(issue => {
-        // Ищем наиболее похожую строку
-        const match = findMostSimilarLine(
-          issue.code,
-          fileLines,
-          Math.max(0, issue.line - 30),
-          Math.min(fileLines.length, issue.line + 30)
-        );
-
-        // Если сходство слишком низкое (больше 0.3), пропускаем комментарий
-        if (match.similarity > 0.3) {
-          console.log(`Skipping comment for line ${issue.line} due to low similarity (${match.similarity})`);
-          return null;
-        }
-
-        return {
-          path: file.filename,
-          line: match.lineNumber,
-          body: `### ${issue.type === 'quality' ? '📝' : issue.type === 'security' ? '🔒' : '⚡'} ${issue.type.charAt(0).toUpperCase() + issue.type.slice(1)}\n${issue.description}\n\n*Чтобы задать вопрос, начните текст с @ai или /ai*`
-        };
-      })
-      .filter((comment): comment is ReviewComment => comment !== null);
+    return comments;
   } catch (error) {
     console.error(`Error analyzing file ${file.filename}:`, error);
     if (error instanceof Error) {
@@ -383,28 +148,8 @@ async function commentOnPR(prInfo: PullRequestInfo) {
     const file = files.find(f => f.filename === comment.path);
     if (!file || !file.patch) return false;
 
-    // Парсим diff чтобы получить измененные строки
-    const changedLines = new Set<number>();
-    const diffLines = file.patch.split('\n');
-    let currentLine = 0;
-
-    for (const line of diffLines) {
-      if (line.startsWith('@@')) {
-        const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-        if (match) {
-          currentLine = parseInt(match[1], 10) - 1;
-        }
-        continue;
-      }
-
-      if (line.startsWith('+')) {
-        changedLines.add(currentLine);
-      }
-      if (!line.startsWith('-')) {
-        currentLine++;
-      }
-    }
-
+    // Используем функцию из utils.ts для парсинга diff
+    const changedLines = parseDiffToChangedLines(file.patch);
     return changedLines.has(comment.line);
   });
 
@@ -506,65 +251,22 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
   }
 
   const content = Buffer.from(fileContent.content, 'base64').toString();
-  const lines = content.split('\n');
-
-  // Получаем контекст кода (25 строк до и после)
-  const startLine = Math.max(0, comment.line - 25);
-  const endLine = Math.min(lines.length, comment.line + 25);
-  const codeContext = lines.slice(startLine, endLine).join('\n');
-
-  // Извлекаем тип проблемы из родительского комментария
-  const typeMatch = parentComment.body.match(/### (📝|🔒|⚡) (Quality|Security|Performance)/i);
-  const type = typeMatch ? typeMatch[2].toLowerCase() : 'quality';
 
   // Убираем @ai или /ai из вопроса
   const question = comment.body.replace(/^(@ai|\/ai)\s+/i, '');
 
   console.log('Анализирую вопрос...');
-  const response = await withRetry(() => fetch(DEEPSEEK_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: 'deepseek-chat',
-      messages: [
-        {
-          role: 'system',
-          content: `Вы эксперт по проверке кода для React + TypeScript проектов.
-            Вы оставили комментарий о проблеме типа "${type}" в следующем коде (строка ${comment.line}):
-            
-            \`\`\`typescript
-            ${codeContext}
-            \`\`\`
-            
-            Ваш комментарий был:
-            ${parentComment.body.split('\n\n')[0]}\n${parentComment.body.split('\n\n')[1]}
-            
-            Пользователь задал вопрос об этой проблеме:
-            ${question}
-            
-            Ответьте на вопрос пользователя, объясняя проблему в контексте конкретной строки кода.
-            Если пользователь просит показать как исправить, предложите конкретное решение с примером кода.
-            Используйте технический, но понятный язык.`,
-        },
-        {
-          role: 'user',
-          content: question,
-        },
-      ],
-      temperature: 0.3,
-      max_tokens: 2000,
-    }),
-  }));
 
-  if (!response.ok) {
-    throw new Error(`DeepSeek API error: ${response.statusText}`);
-  }
-
-  const data = await response.json() as DeepSeekResponse;
-  const answer = data.choices[0].message.content;
+  // Используем функцию из utils.ts для генерации ответа
+  const answer = await generateReplyForComment(
+    comment.path,
+    content,
+    comment.line,
+    question,
+    parentComment.body,
+    DEEPSEEK_API_KEY!,
+    DEEPSEEK_API_URL
+  );
 
   console.log('Отправляю ответ...');
 
@@ -579,7 +281,7 @@ async function handleCommentReply(owner: string, repo: string, comment_id: numbe
     owner,
     repo,
     pull_number: prNumber,
-    body: `> ${question}\n\n${answer}\n\n*Чтобы задать еще вопрос, начните текст с @ai или /ai`,
+    body: `> ${question}\n\n${answer}\n\n*Чтобы задать еще вопрос, начните текст с @ai или /ai*`,
     commit_id: pr.head.sha,
     path: comment.path,
     line: comment.line,
