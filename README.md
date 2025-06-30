@@ -88,4 +88,40 @@ jobs:
 
 ## Лицензия
 
-MIT 
+MIT
+
+## Интеграция с GitLab CI/CD (beta)
+
+> ⚠️ Поддержка GitLab находится в разработке. Адаптер реализован как заготовка, но не содержит рабочей логики. Ниже приведён шаблон для будущей интеграции.
+
+### Пример `.gitlab-ci.yml`
+
+```yaml
+stages:
+  - review
+
+ai_code_review:
+  stage: review
+  image: node:20
+  script:
+    - npm ci
+    - npm run build
+    - node dist/main.js
+  variables:
+    GITLAB_TOKEN: "$GITLAB_TOKEN" # Токен с правами на MR
+    DEEPSEEK_API_KEY: "$DEEPSEEK_API_KEY"
+    GITLAB_PROJECT_ID: "$CI_PROJECT_ID"
+    GITLAB_MR_ID: "$CI_MERGE_REQUEST_IID"
+    # ... другие переменные по мере реализации
+  only:
+    - merge_requests
+```
+
+### Необходимые переменные окружения
+- `GITLAB_TOKEN` — токен с правами на Merge Request API
+- `DEEPSEEK_API_KEY` — ключ DeepSeek
+- `GITLAB_PROJECT_ID`, `GITLAB_MR_ID` — идентификаторы проекта и MR (см. [GitLab CI/CD variables](https://docs.gitlab.com/ee/ci/variables/))
+
+### Ограничения
+- Поддержка GitLab появится после реализации соответствующего адаптера в `src/adapters/gitlab.ts`.
+- API и переменные могут отличаться, следите за обновлениями. 

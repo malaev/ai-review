@@ -46,6 +46,7 @@ if (!GITHUB_TOKEN || !GITHUB_REPOSITORY || !GITHUB_EVENT_NAME || !PR_NUMBER || !
     throw new Error('Missing required environment variables');
 }
 async function main() {
+    console.log('Starting main...');
     const adapter = new github_1.GitHubAdapter({
         token: GITHUB_TOKEN,
         repository: GITHUB_REPOSITORY,
