@@ -15,13 +15,23 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 }) : function(o, v) {
     o["default"] = v;
 });
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -29,6 +39,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const rest_1 = require("@octokit/rest");
 const dotenv = __importStar(require("dotenv"));
 const node_fetch_1 = __importDefault(require("node-fetch"));
+const retry_1 = require("./utils/retry");
 // Загружаем переменные окружения
 dotenv.config();
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
@@ -62,22 +73,6 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
 // Хранилище контекстов обсуждений
 const conversationContexts = new Map();
-// Утилита для задержки
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-// Утилита для повторных попыток
-async function withRetry(operation, retries = MAX_RETRIES) {
-    try {
-        return await operation();
-    }
-    catch (error) {
-        if (retries > 0) {
-            console.log(`Повторная попытка (осталось ${retries})...`);
-            await delay(RETRY_DELAY);
-            return withRetry(operation, retries - 1);
-        }
-        throw error;
-    }
-}
 // Функция для вычисления расстояния Левенштейна между строками
 function levenshteinDistance(a, b) {
     const matrix = Array(b.length + 1).fill(null).map(() => Array(a.length + 1).fill(null));
@@ -127,7 +122,7 @@ function findMostSimilarLine(targetLine, fileLines, startLine, endLine) {
 async function analyzeFile(file, prInfo) {
     try {
         // Получаем содержимое файла
-        const { data: fileContent } = await withRetry(() => octokit.repos.getContent({
+        const { data: fileContent } = await (0, retry_1.withRetry)(() => octokit.repos.getContent({
             owner: prInfo.owner,
             repo: prInfo.repo,
             path: file.filename,
@@ -200,7 +195,7 @@ async function analyzeFile(file, prInfo) {
           }
         ]
       }`;
-        const response = await withRetry(() => (0, node_fetch_1.default)(DEEPSEEK_API_URL, {
+        const response = await (0, retry_1.withRetry)(() => (0, node_fetch_1.default)(DEEPSEEK_API_URL, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -280,13 +275,13 @@ async function analyzeFile(file, prInfo) {
 }
 async function commentOnPR(prInfo) {
     // Получаем файлы, измененные в PR
-    const { data: files } = await withRetry(() => octokit.pulls.listFiles({
+    const { data: files } = await (0, retry_1.withRetry)(() => octokit.pulls.listFiles({
         owner: prInfo.owner,
         repo: prInfo.repo,
         pull_number: prInfo.pull_number,
     }));
     // Получаем diff для каждого файла
-    const { data: pr } = await withRetry(() => octokit.pulls.get({
+    const { data: pr } = await (0, retry_1.withRetry)(() => octokit.pulls.get({
         owner: prInfo.owner,
         repo: prInfo.repo,
         pull_number: prInfo.pull_number,
@@ -327,7 +322,7 @@ async function commentOnPR(prInfo) {
     }
     // Создаем ревью только с комментариями к измененным строкам
     try {
-        const { data: review } = await withRetry(() => octokit.pulls.createReview({
+        const { data: review } = await (0, retry_1.withRetry)(() => octokit.pulls.createReview({
             owner: prInfo.owner,
             repo: prInfo.repo,
             pull_number: prInfo.pull_number,
@@ -356,7 +351,7 @@ async function handlePRReview(prInfo) {
 async function handleCommentReply(owner, repo, comment_id) {
     console.log(`Обрабатываю комментарий ${comment_id}...`);
     // Получаем review comment
-    const { data: comment } = await withRetry(() => octokit.pulls.getReviewComment({
+    const { data: comment } = await (0, retry_1.withRetry)(() => octokit.pulls.getReviewComment({
         owner,
         repo,
         comment_id,
@@ -377,7 +372,7 @@ async function handleCommentReply(owner, repo, comment_id) {
         return;
     }
     // Получаем все review comments в PR
-    const { data: reviewComments } = await withRetry(() => octokit.pulls.listReviewComments({
+    const { data: reviewComments } = await (0, retry_1.withRetry)(() => octokit.pulls.listReviewComments({
         owner,
         repo,
         pull_number: prNumber,
@@ -395,7 +390,7 @@ async function handleCommentReply(owner, repo, comment_id) {
         return;
     }
     // Получаем содержимое файла
-    const { data: fileContent } = await withRetry(() => octokit.repos.getContent({
+    const { data: fileContent } = await (0, retry_1.withRetry)(() => octokit.repos.getContent({
         owner,
         repo,
         path: comment.path,
@@ -416,7 +411,7 @@ async function handleCommentReply(owner, repo, comment_id) {
     // Убираем @ai или /ai из вопроса
     const question = comment.body.replace(/^(@ai|\/ai)\s+/i, '');
     console.log('Анализирую вопрос...');
-    const response = await withRetry(() => (0, node_fetch_1.default)(DEEPSEEK_API_URL, {
+    const response = await (0, retry_1.withRetry)(() => (0, node_fetch_1.default)(DEEPSEEK_API_URL, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -460,12 +455,12 @@ async function handleCommentReply(owner, repo, comment_id) {
     const answer = data.choices[0].message.content;
     console.log('Отправляю ответ...');
     // Получаем информацию о PR для создания review comment
-    const { data: pr } = await withRetry(() => octokit.pulls.get({
+    const { data: pr } = await (0, retry_1.withRetry)(() => octokit.pulls.get({
         owner,
         repo,
         pull_number: prNumber,
     }));
-    await withRetry(() => octokit.pulls.createReviewComment({
+    await (0, retry_1.withRetry)(() => octokit.pulls.createReviewComment({
         owner,
         repo,
         pull_number: prNumber,

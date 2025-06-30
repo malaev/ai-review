@@ -1,6 +1,23 @@
 import { Octokit } from '@octokit/rest';
 import * as dotenv from 'dotenv';
 import fetch from 'node-fetch';
+import {
+  PullRequestInfo,
+  ReviewComment,
+  AnalysisIssue,
+  AnalysisIssueWithCode,
+  AnalysisResponse,
+  AnalysisResponseWithCode
+} from './adapters/types';
+import { withRetry, delay } from './utils/retry';
+
+interface DeepSeekResponse {
+  choices: Array<{
+    message: {
+      content: string;
+    };
+  }>;
+}
 
 // Загружаем переменные окружения
 dotenv.config();
@@ -43,72 +60,8 @@ const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
 
-interface PullRequestInfo {
-  owner: string;
-  repo: string;
-  pull_number: number;
-}
-
-interface CodeAnalysis {
-  quality: string[];
-  security: string[];
-  performance: string[];
-}
-
-interface DeepSeekResponse {
-  choices: Array<{
-    message: {
-      content: string;
-    };
-  }>;
-}
-
-interface ConversationContext {
-  filePath: string;
-  lineStart: number;
-  lineEnd: number;
-  code: string;
-  messages: Array<{
-    role: 'user' | 'assistant';
-    content: string;
-  }>;
-}
-
-interface ReviewComment {
-  path: string;
-  line: number;
-  body: string;
-}
-
-interface AnalysisIssue {
-  line: number;
-  type: 'quality' | 'security' | 'performance';
-  description: string;
-}
-
-interface AnalysisResponse {
-  issues: AnalysisIssue[];
-}
-
 // Хранилище контекстов обсуждений
 const conversationContexts = new Map<string, ConversationContext>();
-
-// Утилита для задержки
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-// Утилита для повторных попыток
-async function withRetry<T>(operation: () => Promise<T>, retries = MAX_RETRIES): Promise<T> {
-  try {
-    return await operation();
-  } catch (error) {
-    if (retries > 0) {
-      console.log(`Повторная попытка (осталось ${retries})...`);
-      await delay(RETRY_DELAY);
-      return withRetry(operation, retries - 1);
-    }
-    throw error;
-  }
-}
 
 // Функция для вычисления расстояния Левенштейна между строками
 function levenshteinDistance(a: string, b: string): number {
@@ -167,12 +120,15 @@ function findMostSimilarLine(targetLine: string, fileLines: string[], startLine:
   return bestMatch;
 }
 
-interface AnalysisIssueWithCode extends AnalysisIssue {
-  code: string;  // Добавляем поле для хранения проблемной строки
-}
-
-interface AnalysisResponseWithCode {
-  issues: AnalysisIssueWithCode[];
+interface ConversationContext {
+  filePath: string;
+  lineStart: number;
+  lineEnd: number;
+  code: string;
+  messages: Array<{
+    role: 'user' | 'assistant';
+    content: string;
+  }>;
 }
 
 async function analyzeFile(file: { filename: string, patch?: string }, prInfo: PullRequestInfo): Promise<ReviewComment[]> {

@@ -38,4 +38,4 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           COMMENT_ID: ${{ github.event.comment.id }}
           REPLY_TO_ID: ${{ github.event.comment.in_reply_to_id }}
-        run: node dist/index.js 
+        run: npm run review 
