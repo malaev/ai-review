@@ -8,7 +8,7 @@
     "package": "npm run build && cp package.json package-lock.json action.yml README.md dist/ && cd dist && npm ci --omit=dev",
     "lint": "eslint . --ext .ts",
     "test": "jest",
-    "review": "node dist/index.js",
+    "review": "node dist/main.js",
     "prepare": "npm run build",
     "test:local": "ts-node scripts/test-locally.ts"
   },
